@@ -213,16 +213,28 @@ fn run(args: &[OsString]) -> Result<(), String> {
                 sample: o.sample,
                 threads,
             };
-            let out = generate(&m, &prompt, &params, |_| {}).map_err(|e| e.to_string())?;
+            // Print the text as it is generated. Each step decodes everything shown so
+            // far and writes what is new, so the bytes are exactly those of decoding the
+            // finished token sequence at once.
             let tokenizer = Tokenizer::new(&m);
-            let shown: Vec<u32> = if m.echo_prompt {
-                out.tokens[out.text.clone()].iter().chain(&out.tokens[out.generated_from..]).copied().collect()
-            } else {
-                out.tokens[out.generated_from..].to_vec()
+            let mut stdout = std::io::stdout();
+            let mut written = 0;
+            let mut failed = None;
+            let mut show = |text: &[u32], generated: &[u32]| {
+                let shown: Vec<u32> = if m.echo_prompt { [text, generated].concat() } else { generated.to_vec() };
+                let bytes = tokenizer.decode(&shown);
+                if failed.is_none() && bytes.len() > written {
+                    failed = stdout.write_all(&bytes[written..]).and_then(|()| stdout.flush()).err();
+                    written = bytes.len();
+                }
             };
-            let mut text = tokenizer.decode(&shown);
-            text.push(b'\n');
-            std::io::stdout().write_all(&text).map_err(|e| e.to_string())
+            let out = generate(&m, &prompt, &params, |step| show(step.text, step.generated))
+                .map_err(|e| e.to_string())?;
+            show(&out.tokens[out.text.clone()], &out.tokens[out.generated_from..]);
+            if let Some(e) = failed {
+                return Err(e.to_string());
+            }
+            stdout.write_all(b"\n").map_err(|e| e.to_string())
         }
         ("trace", _) => {
             let prompt = prompt_bytes(&o, positional)?;

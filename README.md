@@ -96,6 +96,7 @@ Without `--model`, `$DETLLM_MODEL` is used,
 or else `$XDG_DATA_HOME/detllm/model.dllm`
 (default `~/.local/share/detllm/model.dllm`).
 Temperature 0 (the default) is greedy decoding.
+The text is printed as it is generated.
 The prompt is used byte for byte; `--prompt-file` reads it from a file
 (every byte counts, including a final newline).
 Put `--` before a prompt that starts with dashes.

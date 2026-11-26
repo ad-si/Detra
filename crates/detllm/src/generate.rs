@@ -25,6 +25,10 @@ pub struct Step<'a> {
     pub hidden: &'a [i32],
     /// Logits (Q20); empty for prompt positions whose prediction is not needed.
     pub logits: &'a [i32],
+    /// The tokens that encode the user's text.
+    pub text: &'a [u32],
+    /// The tokens generated so far; empty while the prompt is being processed.
+    pub generated: &'a [u32],
 }
 
 pub struct Output {
@@ -91,7 +95,7 @@ pub fn generate(
         let last = end - pos - 1;
         for (i, hidden) in session.hidden().chunks_exact(dim).enumerate() {
             let logits = if i == last { session.logits() } else { &[] };
-            observe(Step { hidden, logits });
+            observe(Step { hidden, logits, text: &tokens[text_range.clone()], generated: &[] });
         }
         pos = end;
     }
@@ -103,7 +107,12 @@ pub fn generate(
         tokens.push(next);
         done = tokens.len() - prompt_len >= params.max_new_tokens || tokens.len() >= model.seq_len;
         session.step(next, !done)?;
-        observe(Step { hidden: session.hidden(), logits: session.logits() });
+        observe(Step {
+            hidden: session.hidden(),
+            logits: session.logits(),
+            text: &tokens[text_range.clone()],
+            generated: &tokens[prompt_len..],
+        });
     }
     Ok(Output { tokens, text: text_range, generated_from: prompt_len })
 }

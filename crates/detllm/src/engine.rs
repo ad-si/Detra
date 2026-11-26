@@ -12,8 +12,8 @@
 //! activations are clamped to the `i32` range.
 
 use crate::fixed::{
-    exp_neg_q30, isqrt_u128, rshift_round, rshift_round_wide, saturate, sigmoid_q30,
-    sigmoid_q30_wide, silu, softmax_q30, softplus_q30,
+    clamp_i64, exp_neg_q30, isqrt_u128, rshift_round, rshift_round_wide, saturate, saturate_wide,
+    sigmoid_q30, sigmoid_q30_wide, silu, softmax_q30, softplus_q30,
 };
 use crate::model::{Attention, Delta, Mixer, Model};
 use crate::pool::{Pool, Weight};
@@ -47,7 +47,7 @@ fn sum_sq(values: impl Iterator<Item = i64>) -> u128 {
 fn rmsnorm_residual(out: &mut [i32], x: &[i64], w: &[i32], eps_q32: u32) {
     let rms = rms_q30(sum_sq(x.iter().copied()), x.len(), 32, eps_q32) << 6;
     for ((o, &xv), &wv) in out.iter_mut().zip(x).zip(w) {
-        *o = saturate(((xv as i128 * wv as i128) / rms) as i64);
+        *o = saturate_wide((xv as i128 * wv as i128) / rms);
     }
 }
 
@@ -55,7 +55,7 @@ fn rmsnorm_residual(out: &mut [i32], x: &[i64], w: &[i32], eps_q32: u32) {
 /// divisor, in Q20.
 #[inline]
 fn normed(x: i64, w: i32, rms: i128) -> i32 {
-    saturate((((x as i128 * w as i128) << 6) / rms) as i64)
+    saturate_wide(((x as i128 * w as i128) << 6) / rms)
 }
 
 /// In-place RMSNorm of one attention head (Q20).
@@ -252,7 +252,7 @@ impl Session {
                 if m.out_gate {
                     value = rshift_round(value * sigmoid_q30(head[hd + i]), 30);
                 }
-                out[h * hd + i] = value as i32;
+                out[h * hd + i] = saturate(value);
             }
         }
         self.pool.matvec(&m, Weight::Wo(l), &out, TO_RESIDUAL)
@@ -308,8 +308,8 @@ impl Session {
             };
             let (k_den, q_den) = (norm(k_raw, 1), norm(q_raw, kd));
             for i in 0..kd {
-                key[i] = (((k_raw[i] as i128) << 40) / k_den) as i64;
-                query[i] = (((q_raw[i] as i128) << 40) / q_den) as i64;
+                key[i] = clamp_i64(((k_raw[i] as i128) << 40) / k_den);
+                query[i] = clamp_i64(((q_raw[i] as i128) << 40) / q_den);
             }
 
             // decay = exp(-a_exp * softplus(a + dt_bias)), beta = sigmoid(b), both Q30.
@@ -342,7 +342,7 @@ impl Session {
             let core: Vec<i64> = read.iter().map(|&acc| rshift_round_wide(acc, 30)).collect();
             let rms = rms_q30(sum_sq(core.iter().copied()), vd, 32, m.rms_eps_q32) << 6;
             for i in 0..vd {
-                let n = saturate(((core[i] as i128 * g.gnorm[i] as i128) / rms) as i64) as i64;
+                let n = saturate_wide((core[i] as i128 * g.gnorm[i] as i128) / rms) as i64;
                 out[h * vd + i] = saturate(rshift_round(n * silu(z[h * vd + i]) as i64, 20));
             }
         }

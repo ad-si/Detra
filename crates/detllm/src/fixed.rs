@@ -39,6 +39,18 @@ pub fn saturate(v: i64) -> i32 {
     v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+/// Clamp a 128-bit value to the `i32` range.
+#[inline(always)]
+pub fn saturate_wide(v: i128) -> i32 {
+    v.clamp(i32::MIN as i128, i32::MAX as i128) as i32
+}
+
+/// Clamp a 128-bit value to the `i64` range.
+#[inline(always)]
+pub fn clamp_i64(v: i128) -> i64 {
+    v.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 /// Floor of the square root.
 pub const fn isqrt_u128(n: u128) -> u128 {
     let mut x = n;
@@ -238,6 +250,11 @@ mod tests {
         assert_eq!(saturate(i64::MAX), i32::MAX);
         assert_eq!(saturate(i64::MIN), i32::MIN);
         assert_eq!(saturate(-7), -7);
+        assert_eq!(saturate_wide(i128::MAX), i32::MAX);
+        assert_eq!(saturate_wide(i128::MIN), i32::MIN);
+        assert_eq!(clamp_i64(i128::MAX), i64::MAX);
+        assert_eq!(clamp_i64(i128::MIN), i64::MIN);
+        assert_eq!(clamp_i64(-7), -7);
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //!   norm2       [dim]
 //!   w_gate, w_up [hidden_dim, dim], w_down [dim, hidden_dim]
 //! final_norm    [dim]
-//! rope_cos, rope_sin  [seq_len, rotary_dim / 2]      Q30
+//! rope_cos, rope_sin  [seq_len, rotary_dim / 2]      Q30, each within [-2^30, 2^30]
 //! wcls          [vocab_size, dim]        only if shared_classifier = 0
 //! tokenizer     (see below)
 //! prefix, suffix, stop: each `u32 count` followed by that many token ids
@@ -320,6 +320,10 @@ impl Model {
         let rope = mul(self.seq_len, self.rotary_dim / 2)?;
         check("rope_cos", self.rope_cos.len(), rope)?;
         check("rope_sin", self.rope_sin.len(), rope)?;
+        // The rotation relies on |cos|, |sin| <= 1 to stay inside 64 bits.
+        if self.rope_cos.iter().chain(&self.rope_sin).any(|v| !(-(1 << 30)..=1 << 30).contains(v)) {
+            return err("RoPE table entry is outside [-1, 1]");
+        }
         if let Some(w) = &self.wcls {
             check("wcls", w.len(), mul(v, d)?)?;
         }

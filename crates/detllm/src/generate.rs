@@ -47,6 +47,16 @@ pub fn generate(
 ) -> Result<Output> {
     let tokenizer = Tokenizer::new(model);
     let prompt = if model.trim_prompt { tokenizer.trim(prompt) } else { prompt };
+    // Every token covers at most `longest` bytes, so a prompt this long cannot fit.
+    // Rejecting it here avoids tokenizing arbitrarily large inputs first.
+    let longest = model.tokens.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    if prompt.len() / longest > model.seq_len {
+        return err(format!(
+            "prompt has {} bytes, which is more than the context window of {} tokens can hold",
+            prompt.len(),
+            model.seq_len
+        ));
+    }
     let text = tokenizer.encode(prompt)?;
     let mut tokens = model.prefix.clone();
     let text_range = tokens.len()..tokens.len() + text.len();

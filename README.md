@@ -37,6 +37,42 @@ prompts should be in NFC to match the original Qwen tokenizer.
 [llama2.c]: https://github.com/karpathy/llama2.c
 
 
+## Guarantee
+
+For a given model file, prompt (as bytes), and parameters,
+every run on every machine ends in exactly one of two ways:
+
+- the same hidden states, logits, and tokens, bit for bit, or
+- an error, where a machine cannot run the request at all
+  (out of memory, or a model too large for a 32-bit address space).
+
+There is no third outcome: no input can make two machines produce different results.
+This holds for arbitrary bytes as the prompt (including invalid UTF-8),
+for any sampling parameters, and for any model file
+(a damaged file is rejected or runs normally, but never differently per machine).
+
+How this is ensured:
+
+- Every arithmetic operation is either proven unable to overflow,
+  or uses explicit wrapping or saturating integer arithmetic.
+  The test-suite runs with overflow checks enabled,
+  so an unproven overflow fails the tests instead of going unnoticed.
+- Adversarial tests with fixed expected digests run on every target:
+  random prompt bytes with random and out-of-range parameters,
+  weights at the extremes of their range, and corrupted model files.
+- `golden/prompts.txt` contains hostile prompts for the real models:
+  invalid UTF-8, control characters, special-token text, mixed scripts,
+  whitespace only, and a prompt longer than the context window.
+
+This rests on a manual audit of the arithmetic plus the tests above,
+not on a machine-checked proof.
+
+Not covered: the offline converters (a model is identified by the hash
+of the converted file, not by how it was produced),
+and prompt bytes as passed by the shell on platforms
+where arguments are not raw bytes (use `--prompt-file` there).
+
+
 ## Usage
 
 ```sh
@@ -47,6 +83,7 @@ detllm generate "Why is the sky blue?" --max-tokens 100
 ```txt
 detllm generate <prompt> [--max-tokens N] [--temperature T] [--top-k K]
                 [--top-p P] [--seed S] [--model model.dllm]
+detllm generate --prompt-file <path> [...]
 detllm info [--model model.dllm]
 detllm digest <prompts.txt> [--max-tokens N] [--model model.dllm]
 ```
@@ -55,13 +92,16 @@ Without `--model`, `$DETLLM_MODEL` is used,
 or else `$XDG_DATA_HOME/detllm/model.dllm`
 (default `~/.local/share/detllm/model.dllm`).
 Temperature 0 (the default) is greedy decoding.
+The prompt is used byte for byte; `--prompt-file` reads it from a file
+(every byte counts, including a final newline).
+Put `--` before a prompt that starts with dashes.
 
 
 ## Verification
 
 `detllm digest` runs every prompt in `golden/prompts.txt` greedily
 and with seeded sampling and prints a SHA-256
-over all hidden states, logits, and tokens.
+over all hidden states, logits, and tokens (or the error).
 The `verify` targets compare that output with the files in `golden/`:
 
 | Target                    | Checks                                                               |
@@ -75,6 +115,8 @@ The `verify` targets compare that output with the files in `golden/`:
 | `make verify-docker-qwen` | Qwen3.5-0.8B on emulated big-endian s390x Linux                      |
 
 `make verify` runs the tests, the linter, and the first four.
+`make test` runs the test-suite natively in debug and release builds;
+the x86-64, WASM, Miri, and `verify-docker` targets also run it on their architecture.
 `make check-qwen` compares the integer engine
 with the Hugging Face float implementation of Qwen3.5.
 `make setup` installs the required Rust targets and components.

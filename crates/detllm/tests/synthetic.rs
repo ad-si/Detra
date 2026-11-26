@@ -22,9 +22,9 @@ impl Weights {
         (0..n).map(|_| (self.0.next_u64() % (1 << 24)) as i32).collect()
     }
 
-    /// Uniform in [-1, 1) in Q30.
+    /// Uniform in [-1, 1] in Q30.
     fn q30(&mut self, n: usize) -> Vec<i32> {
-        (0..n).map(|_| (self.0.next_u64() % (1 << 31)) as i64 as i32 ^ i32::MIN).collect()
+        (0..n).map(|_| ((self.0.next_u64() % ((1 << 31) + 1)) as i64 - (1 << 30)) as i32).collect()
     }
 }
 
@@ -199,8 +199,8 @@ fn qwen_like() -> Model {
 #[test]
 fn file_format_roundtrip() {
     for (model, digest) in [
-        (llama_like(), "433a4bff984672e124904a9431ec4f7ee68abfac8854480f57bcd8f83d8a064d"),
-        (qwen_like(), "f21c3104b5fdf8717b48fa9bf7848b27120d25882de3392c75beaba64361351a"),
+        (llama_like(), "84cfd42ba382c24f71a6d65431af7263417c85e4069ca51305015b044a838f3c"),
+        (qwen_like(), "6fc14cebc2328f0cca04272736fbed1a79125550497960934a83b2d61d41ea07"),
     ] {
         let bytes = model.to_bytes().unwrap();
         assert_eq!(Model::from_bytes(&bytes).unwrap(), model);
@@ -281,15 +281,15 @@ fn digests(model: Model, prompt: &[u8], threads: usize) -> (String, String) {
 #[test]
 fn llama_like_digests_are_fixed() {
     let (greedy, sampled) = digests(llama_like(), b"the and then", 1);
-    assert_eq!(greedy, "03383a67f92334d76b856ce3f577b199f1972092a8b751d88094b4062923d299");
-    assert_eq!(sampled, "a70b49a84f1badaff7506ef0ea01848eadc21b0dbf6461d1102cd44852b3a2c4");
+    assert_eq!(greedy, "6a6aef2d12dcbd14731b961735ece5801b1d78fc605686803607bd47ab7e7842");
+    assert_eq!(sampled, "dc18f273b0bcb9e11ccfcc9757b73e6277364198c40fbc0919b59b0c842903fa");
 }
 
 #[test]
 fn qwen_like_digests_are_fixed() {
     let (greedy, sampled) = digests(qwen_like(), b"the and 12 then", 1);
-    assert_eq!(greedy, "6f923f5d40f223fb88151a42d6b9d04453f2a74f10a801e2dea516b888ddf02c");
-    assert_eq!(sampled, "e82d4b41ca83716262ffdb70d597ee50433fb5e120a85764b59b28eab0c2e85d");
+    assert_eq!(greedy, "9d2900a1c1c82ca84eb0c1bafd2634355545b5146d9c8659f0e7b84c952d055b");
+    assert_eq!(sampled, "036a2be44cba63eb3804ba85f6ca31dffe34e62a30bc9ec240da7cd5551b36f9");
 }
 
 /// Threads are unavailable on some targets (and slow under Miri); everywhere else the
@@ -311,4 +311,178 @@ fn thread_count_does_not_change_the_result() {
     for threads in [2, 3, 8] {
         assert_eq!(digests(model.clone(), b"the and then", threads), one);
     }
+}
+
+/// Every weight tensor of a model except the RoPE tables.
+fn weight_tensors(model: &mut Model) -> Vec<&mut Vec<i32>> {
+    let mut all = vec![&mut model.tok_emb, &mut model.final_norm];
+    if let Some(w) = &mut model.wcls {
+        all.push(w);
+    }
+    for layer in &mut model.layers {
+        all.extend([&mut layer.norm1, &mut layer.norm2, &mut layer.w_gate, &mut layer.w_up, &mut layer.w_down]);
+        match &mut layer.mixer {
+            Mixer::Attention(a) => {
+                all.extend([&mut a.wq, &mut a.wk, &mut a.wv, &mut a.wo, &mut a.q_norm, &mut a.k_norm])
+            }
+            Mixer::Delta(g) => all.extend([
+                &mut g.w_qkv, &mut g.w_z, &mut g.w_b, &mut g.w_a, &mut g.conv, &mut g.a_exp, &mut g.dt_bias,
+                &mut g.gnorm, &mut g.w_out,
+            ]),
+        }
+    }
+    all
+}
+
+/// Replace all weights by values chosen to provoke overflow: the extremes of `i32`,
+/// values around zero, and arbitrary bit patterns.
+fn with_extreme_weights(mut model: Model, seed: u64) -> Model {
+    let mut rng = Rng::new(seed);
+    let mut pick = |limit: i32| -> i32 {
+        match rng.next_u64() % 8 {
+            0 => limit,
+            1 => -limit,
+            2 => 0,
+            3 => 1,
+            4 => -1,
+            _ => ((rng.next_u64() % (2 * limit as u64 + 1)) as i64 - limit as i64) as i32,
+        }
+    };
+    for tensor in weight_tensors(&mut model) {
+        for v in tensor.iter_mut() {
+            *v = match pick(i32::MAX) {
+                i32::MAX => i32::MAX,
+                v if v == -i32::MAX => i32::MIN,
+                v => v,
+            };
+        }
+    }
+    for v in model.rope_cos.iter_mut().chain(model.rope_sin.iter_mut()) {
+        *v = pick(1 << 30);
+    }
+    model
+}
+
+/// A prompt built to exercise the tokenizers: arbitrary bytes (mostly invalid UTF-8),
+/// words from the vocabulary, whitespace runs, multi-byte characters and contractions.
+fn random_prompt(rng: &mut Rng) -> Vec<u8> {
+    const PARTS: &[&str] = &[
+        "the", " the", "and", "an", "th", " ", "  ", "\n", "\r\n", "\t", "'ll", "'S", "'", "1", "23", "?!", "...",
+        "\u{e9}", "e\u{301}", "\u{3000}", "\u{1F642}", "x", "THE", "<|start|>", "<|end|>", "<s>", "</s>", "\0",
+    ];
+    let mut out = Vec::new();
+    for _ in 0..rng.next_u64() % 12 {
+        match rng.next_u64() % 4 {
+            0 => out.extend((0..rng.next_u64() % 5).map(|_| rng.next_u64() as u8)),
+            _ => out.extend_from_slice(PARTS[(rng.next_u64() % PARTS.len() as u64) as usize].as_bytes()),
+        }
+    }
+    out
+}
+
+fn random_params(rng: &mut Rng) -> GenParams {
+    const TEMPERATURES: &[i64] = &[0, 0, 1, 6_554, 52_429, 65_536, 1 << 30, i64::MAX, -5];
+    const TOP_K: &[usize] = &[0, 1, 2, 7, 100_000];
+    const TOP_P: &[i64] = &[65_536, 58_982, 32_768, 1, 0, -3, 1 << 40];
+    let mut choose = |n: usize| (rng.next_u64() % n as u64) as usize;
+    GenParams {
+        max_new_tokens: choose(7),
+        sample: SampleParams {
+            temperature_q16: TEMPERATURES[choose(TEMPERATURES.len())],
+            top_k: TOP_K[choose(TOP_K.len())],
+            top_p_q16: TOP_P[choose(TOP_P.len())],
+            seed: [0, 1, u64::MAX, 0xDEAD_BEEF][choose(4)],
+        },
+        threads: 1,
+    }
+}
+
+/// One digest over the complete outcome (hidden states, logits, tokens, or the error)
+/// of `cases` random prompts with random parameters.
+fn fuzz_digest(model: Model, seed: u64, cases: usize) -> String {
+    let model = Arc::new(model);
+    let mut rng = Rng::new(seed);
+    let mut all = detllm::sha256::Sha256::new();
+    let mut completed = 0;
+    for _ in 0..cases {
+        let prompt = random_prompt(&mut rng);
+        let params = random_params(&mut rng);
+        match run_digest(&model, &prompt, &params) {
+            Ok((digest, _)) => {
+                all.update(&digest);
+                completed += 1;
+            }
+            Err(e) => all.update(e.0.as_bytes()),
+        }
+    }
+    assert!(completed * 2 > cases, "most random prompts should fit the context window");
+    hex(&all.finalize())
+}
+
+/// Arbitrary prompt bytes and sampling parameters. In a debug build this also proves
+/// that no input reaches an arithmetic overflow that is not explicitly wrapping.
+#[test]
+#[cfg_attr(miri, ignore = "too slow under Miri")]
+fn arbitrary_inputs_have_fixed_digests() {
+    assert_eq!(fuzz_digest(llama_like(), 1, 300), "c6c246349a7d23a4be7d26d3ded256a4af8ab112795f27514f8cc79ea8580ece");
+    assert_eq!(fuzz_digest(qwen_like(), 2, 300), "b3987e59e6ce677d902bff684525945b1c26e7f97a7c824b596cbfe0a66c3d67");
+}
+
+/// The same with weights at the extremes of their range, where sums wrap and
+/// activations saturate constantly. The result must still be the same everywhere.
+#[test]
+#[cfg_attr(miri, ignore = "too slow under Miri")]
+fn extreme_weights_have_fixed_digests() {
+    assert_eq!(fuzz_digest(with_extreme_weights(llama_like(), 3), 4, 150), "ce491fe47367739bdc33a18668172ab0f7c3dd7da9f1d94a80e6a1ab5ed7fa6a");
+    assert_eq!(fuzz_digest(with_extreme_weights(qwen_like(), 5), 6, 150), "235c0885dc81bb0aab3fa5bc50be288dd7dca1b7ae5e630821a1639b534d80a3");
+}
+
+/// Damaged model files must be rejected with an error or run normally, never panic,
+/// and the outcome must be the same everywhere.
+#[test]
+#[cfg_attr(miri, ignore = "too slow under Miri")]
+fn corrupted_model_files_have_fixed_outcomes() {
+    let mut all = detllm::sha256::Sha256::new();
+    let (mut loaded, mut rejected) = (0, 0);
+    for (model, seed) in [(llama_like(), 11), (qwen_like(), 12)] {
+        let bytes = model.to_bytes().unwrap();
+        let mut rng = Rng::new(seed);
+        for case in 0..400 {
+            let mut damaged = bytes.clone();
+            match case % 4 {
+                // Header and layer types.
+                0 => damaged[4 + (rng.next_u64() % 100) as usize] = rng.next_u64() as u8,
+                // Tokenizer tables and prompt template at the end of the file.
+                1 => {
+                    let at = damaged.len() - 1 - (rng.next_u64() % 3000) as usize;
+                    damaged[at] = rng.next_u64() as u8;
+                }
+                // Anywhere, several bytes.
+                2 => {
+                    for _ in 0..4 {
+                        let at = (rng.next_u64() % damaged.len() as u64) as usize;
+                        damaged[at] ^= 1 << (rng.next_u64() % 8);
+                    }
+                }
+                // Truncation.
+                _ => damaged.truncate((rng.next_u64() % damaged.len() as u64) as usize),
+            }
+            match Model::from_bytes(&damaged) {
+                Ok(model) => {
+                    loaded += 1;
+                    let params = GenParams { max_new_tokens: 3, sample: SampleParams::GREEDY, threads: 1 };
+                    match run_digest(&Arc::new(model), b"the and 12", &params) {
+                        Ok((digest, _)) => all.update(&digest),
+                        Err(e) => all.update(e.0.as_bytes()),
+                    }
+                }
+                Err(_) => {
+                    rejected += 1;
+                    all.update(b"rejected");
+                }
+            }
+        }
+    }
+    assert!(loaded > 100 && rejected > 100, "loaded {loaded}, rejected {rejected}");
+    assert_eq!(hex(&all.finalize()), "e7cc1f5f10694044827ab8a606348b48c50c05bebe134dec7269280d0dfd42ab");
 }

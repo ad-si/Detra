@@ -21,7 +21,7 @@ check = $(1) digest golden/prompts.txt --model $(2) | diff - $(3) && echo "$(4):
 # $(1) = docker platform
 docker_verify = docker run --rm --platform $(1) -v "$(CURDIR)":/src:ro -w /src \
 	-e CARGO_TARGET_DIR=/tmp/target $(RUST_IMAGE) sh -c \
-	'cargo build --release --locked -p detllm 2>&1 >/dev/null | tail -1 >&2; /tmp/target/release/detllm digest golden/prompts.txt --model $(STORIES)' \
+	'cargo test --release --locked -p detllm 2>&1 | grep "test result" >&2; /tmp/target/release/detllm digest golden/prompts.txt --model $(STORIES)' \
 	| diff - $(GOLDEN_STORIES) && echo "$(1) stories15M: bit-exact"
 
 .PHONY: help
@@ -33,13 +33,14 @@ build: ## Build the engine and the converter (release)
 	cargo build --release --locked
 
 .PHONY: test
-test: ## Run unit tests and the synthetic-model determinism tests
+test: ## Run unit tests and the synthetic-model determinism tests (debug and release)
 	cargo test --locked
+	cargo test --locked --release
 
 .PHONY: lint
 lint: ## Clippy, plus a check that the engine crate contains no floating point
 	cargo clippy --locked --all-targets -- -D warnings
-	@! grep -rnE '\bf(32|64)\b' crates/detllm/src crates/detllm/tests || { echo "floating point found in the engine crate"; exit 1; }
+	scripts/no-float.sh
 
 models/stories15M.bin:
 	curl -L --fail -o $@ $(STORIES_URL)
@@ -83,12 +84,13 @@ verify-debug: models ## Unoptimized build with overflow checks enabled (small mo
 
 .PHONY: verify-x86_64
 verify-x86_64: models ## x86-64 build run under Rosetta
-	cargo build --release --locked -p detllm --target x86_64-apple-darwin
+	cargo test --release --locked -p detllm --target x86_64-apple-darwin
 	$(call check,target/x86_64-apple-darwin/release/detllm,$(STORIES),$(GOLDEN_STORIES),x86_64 stories15M)
 	$(call check,target/x86_64-apple-darwin/release/detllm,$(QWEN),$(GOLDEN_QWEN),x86_64 qwen3.5-0.8b)
 
 .PHONY: verify-wasm
 verify-wasm: models ## WebAssembly (32-bit) build run under Node's WASI (small model)
+	CARGO_TARGET_WASM32_WASIP1_RUNNER="node --no-warnings $(CURDIR)/scripts/wasi-run.mjs" cargo test --release --locked -p detllm --target wasm32-wasip1
 	cargo build --release --locked -p detllm --target wasm32-wasip1
 	$(call check,node --no-warnings scripts/wasi-run.mjs target/wasm32-wasip1/release/detllm.wasm,$(STORIES),$(GOLDEN_STORIES),wasm32 stories15M)
 

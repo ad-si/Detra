@@ -9,7 +9,8 @@
 //! side is not reproducible across machines.
 
 use detllm::generate::{generate, GenParams};
-use detllm::model::{Layer, Model};
+use detllm::model::{Attention, Layer, Mixer, Model, Vocab};
+use std::sync::Arc;
 use detllm::sample::{argmax, SampleParams};
 use detllm::sha256::{hex, sha256};
 use std::process::ExitCode;
@@ -213,39 +214,55 @@ fn convert(ckpt_path: &str, tokenizer_path: &str, out_path: &str) -> Result<(), 
     let c = read_checkpoint(ckpt_path)?;
     let (tokens, ranks) = read_tokenizer(tokenizer_path, c.vocab_size)?;
     let (d, h) = (c.dim, c.hidden_dim);
-    let q16 = |name: &str, v: &[f32]| to_fixed(name, v, 16);
+    let q24 = |name: &str, v: &[f32]| to_fixed(name, v, 24);
     let mut layers = Vec::new();
     for l in 0..c.n_layers {
         layers.push(Layer {
-            rms_att: q16("rms_att", &c.rms_att[l * d..(l + 1) * d])?,
-            wq: q16("wq", &c.wq[l * d * d..(l + 1) * d * d])?,
-            wk: q16("wk", &c.wk[l * d * d..(l + 1) * d * d])?,
-            wv: q16("wv", &c.wv[l * d * d..(l + 1) * d * d])?,
-            wo: q16("wo", &c.wo[l * d * d..(l + 1) * d * d])?,
-            rms_ffn: q16("rms_ffn", &c.rms_ffn[l * d..(l + 1) * d])?,
-            w1: q16("w1", &c.w1[l * h * d..(l + 1) * h * d])?,
-            w2: q16("w2", &c.w2[l * d * h..(l + 1) * d * h])?,
-            w3: q16("w3", &c.w3[l * h * d..(l + 1) * h * d])?,
+            norm1: q24("rms_att", &c.rms_att[l * d..(l + 1) * d])?,
+            mixer: Mixer::Attention(Attention {
+                wq: q24("wq", &c.wq[l * d * d..(l + 1) * d * d])?,
+                wk: q24("wk", &c.wk[l * d * d..(l + 1) * d * d])?,
+                wv: q24("wv", &c.wv[l * d * d..(l + 1) * d * d])?,
+                wo: q24("wo", &c.wo[l * d * d..(l + 1) * d * d])?,
+                q_norm: Vec::new(),
+                k_norm: Vec::new(),
+            }),
+            norm2: q24("rms_ffn", &c.rms_ffn[l * d..(l + 1) * d])?,
+            w_gate: q24("w1", &c.w1[l * h * d..(l + 1) * h * d])?,
+            w_down: q24("w2", &c.w2[l * d * h..(l + 1) * d * h])?,
+            w_up: q24("w3", &c.w3[l * h * d..(l + 1) * h * d])?,
         });
     }
     let model = Model {
         dim: d,
         hidden_dim: h,
-        n_layers: c.n_layers,
-        n_heads: c.n_heads,
         vocab_size: c.vocab_size,
         seq_len: c.seq_len,
-        bos_id: BOS_ID,
-        eos_id: EOS_ID,
-        byte_base: BYTE_BASE,
-        tok_emb: q16("tok_emb", &c.tok_emb)?,
+        rms_eps_q32: 42_950, // ceil(1e-5 * 2^32)
+        n_heads: c.n_heads,
+        n_kv_heads: c.n_heads,
+        head_dim: d / c.n_heads,
+        rotary_dim: d / c.n_heads,
+        rope_halves: false,
+        qk_norm: false,
+        out_gate: false,
+        lin_heads: 0,
+        lin_k_dim: 0,
+        lin_v_dim: 0,
+        conv_kernel: 0,
+        echo_prompt: true,
+        trim_prompt: false,
+        tok_emb: q24("tok_emb", &c.tok_emb)?,
         layers,
-        rms_final: q16("rms_final", &c.rms_final)?,
+        final_norm: q24("rms_final", &c.rms_final)?,
         rope_cos: to_fixed("rope_cos", &c.rope_cos, 30)?,
         rope_sin: to_fixed("rope_sin", &c.rope_sin, 30)?,
-        wcls: c.wcls.as_deref().map(|w| q16("wcls", w)).transpose()?,
+        wcls: c.wcls.as_deref().map(|w| q24("wcls", w)).transpose()?,
         tokens,
-        ranks,
+        vocab: Vocab::Scored { byte_base: BYTE_BASE, ranks },
+        prefix: vec![BOS_ID],
+        suffix: Vec::new(),
+        stop: vec![BOS_ID, EOS_ID],
     };
     let bytes = model.to_bytes().map_err(|e| e.to_string())?;
     std::fs::write(out_path, &bytes).map_err(|e| format!("{out_path}: {e}"))?;
@@ -345,12 +362,18 @@ fn float_logits(c: &Checkpoint, tokens: &[u32]) -> Vec<Vec<f32>> {
 fn compare(ckpt_path: &str, model_path: &str, prompt: &str, max_new_tokens: usize) -> Result<(), String> {
     let c = read_checkpoint(ckpt_path)?;
     let bytes = std::fs::read(model_path).map_err(|e| format!("{model_path}: {e}"))?;
-    let model = Model::from_bytes(&bytes).map_err(|e| e.to_string())?;
-    let params = GenParams { max_new_tokens, sample: SampleParams::GREEDY };
+    let model = Arc::new(Model::from_bytes(&bytes).map_err(|e| e.to_string())?);
+    let params = GenParams { max_new_tokens, sample: SampleParams::GREEDY, threads: 1 };
+    // The engine only computes logits from the last prompt position onward.
     let mut int_logits: Vec<Vec<i32>> = Vec::new();
-    let tokens = generate(&model, prompt.as_bytes(), &params, |l| int_logits.push(l.to_vec()))
-        .map_err(|e| e.to_string())?;
-    let float = float_logits(&c, &tokens[..int_logits.len()]);
+    let out = generate(&model, prompt.as_bytes(), &params, |step| {
+        if !step.logits.is_empty() {
+            int_logits.push(step.logits.to_vec());
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    let first = out.generated_from - 1;
+    let float = float_logits(&c, &out.tokens[..first + int_logits.len()]).split_off(first);
 
     let mut agree = 0;
     let mut max_diff = 0f64;
@@ -365,7 +388,7 @@ fn compare(ckpt_path: &str, model_path: &str, prompt: &str, max_new_tokens: usiz
             agree += 1;
         }
         for (&i, &f) in il.iter().zip(fl) {
-            let diff = (i as f64 / 65536.0 - f as f64).abs();
+            let diff = (i as f64 / 1048576.0 - f as f64).abs();
             max_diff = max_diff.max(diff);
             sum_diff += diff;
             count += 1.0;

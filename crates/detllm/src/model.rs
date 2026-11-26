@@ -1,96 +1,189 @@
-//! Model file format (`.dllm`, version 1). All integers are little-endian.
+//! Model file format (`.dllm`, version 2). All integers are little-endian `u32`/`i32`.
 //!
 //! ```text
-//! magic        4 bytes  "DLLM"
-//! header       11 x u32 version, dim, hidden_dim, n_layers, n_heads, vocab_size,
-//!                       seq_len, bos_id, eos_id, byte_base, shared_classifier (0|1)
-//! tok_emb      i32[vocab_size * dim]                 Q16
+//! magic "DLLM"
+//! header (u32 each):
+//!   version, dim, hidden_dim, n_layers, vocab_size, seq_len, rms_eps_q32,
+//!   n_heads, n_kv_heads, head_dim, rotary_dim, rope_halves, qk_norm, out_gate,
+//!   lin_heads, lin_k_dim, lin_v_dim, conv_kernel,
+//!   shared_classifier, tokenizer_kind, echo_prompt, trim_prompt
+//! layer_types   u32[n_layers]            0 = attention, 1 = gated delta
+//! tok_emb       [vocab_size, dim]        Q24
 //! per layer:
-//!   rms_att    i32[dim]                              Q16
-//!   wq wk wv wo  i32[dim * dim] each, row-major      Q16
-//!   rms_ffn    i32[dim]                              Q16
-//!   w1         i32[hidden_dim * dim]                 Q16
-//!   w2         i32[dim * hidden_dim]                 Q16
-//!   w3         i32[hidden_dim * dim]                 Q16
-//! rms_final    i32[dim]                              Q16
-//! rope_cos     i32[seq_len * head_size / 2]          Q30
-//! rope_sin     i32[seq_len * head_size / 2]          Q30
-//! wcls         i32[vocab_size * dim]                 Q16, only if shared_classifier = 0
-//! per token:   u32 rank, u32 len, u8[len] bytes
+//!   norm1       [dim]                    Q24
+//!   attention:  wq [q_rows, dim], wk [kv_rows, dim], wv [kv_rows, dim],
+//!               wo [dim, n_heads * head_dim]; if qk_norm: q_norm, k_norm [head_dim]
+//!   delta:      w_qkv [2K + V, dim], w_z [V, dim], w_b, w_a [lin_heads, dim],
+//!               conv [2K + V, conv_kernel], a_exp, dt_bias [lin_heads],
+//!               gnorm [lin_v_dim], w_out [dim, V]
+//!   norm2       [dim]
+//!   w_gate, w_up [hidden_dim, dim], w_down [dim, hidden_dim]
+//! final_norm    [dim]
+//! rope_cos, rope_sin  [seq_len, rotary_dim / 2]      Q30
+//! wcls          [vocab_size, dim]        only if shared_classifier = 0
+//! tokenizer     (see below)
+//! prefix, suffix, stop: each `u32 count` followed by that many token ids
 //! ```
 //!
-//! Token ids below `byte_base` are special tokens. Ids `byte_base .. byte_base + 256`
-//! are the raw byte tokens 0x00..0xFF (their `bytes` field is that single byte).
-//! All later ids are regular tokens; a larger `rank` wins a merge.
+//! All tensors are `i32` in Q24 unless noted, matrices row-major `[rows, cols]`.
+//! `q_rows = n_heads * head_dim * (1 + out_gate)`, `kv_rows = n_kv_heads * head_dim`,
+//! `K = lin_heads * lin_k_dim`, `V = lin_heads * lin_v_dim`.
+//! Norm weights are the effective multipliers (any `1 + w` is already applied).
 //!
-//! The identity of a model is the SHA-256 of its file.
+//! Tokenizer kind 0 (scored merges): `u32 byte_base`, then per token `u32 rank,
+//! u32 len, bytes`. Kind 1 (byte-level BPE): per token `u32 special, u32 len, bytes`;
+//! `u32 n_merges` and per merge `left, right, result` in priority order;
+//! `u32[256]` byte token ids; `u32 n_ranges` and per range `first, last, class` with
+//! class 1 = letter, 2 = mark, 3 = number, 4 = whitespace.
+//!
+//! A prompt is run as `prefix ++ encode(text) ++ suffix`, where leading and trailing
+//! whitespace is removed from `text` first if `trim_prompt` is set; generation ends at
+//! any `stop` token. The identity of a model is the SHA-256 of its file.
 
-use crate::{err, Result};
+use crate::{err, Error, Result};
+use std::io::Read;
 
 pub const MAGIC: [u8; 4] = *b"DLLM";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Layer {
-    pub rms_att: Vec<i32>,
+pub struct Attention {
     pub wq: Vec<i32>,
     pub wk: Vec<i32>,
     pub wv: Vec<i32>,
     pub wo: Vec<i32>,
-    pub rms_ffn: Vec<i32>,
-    pub w1: Vec<i32>,
-    pub w2: Vec<i32>,
-    pub w3: Vec<i32>,
+    pub q_norm: Vec<i32>,
+    pub k_norm: Vec<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delta {
+    pub w_qkv: Vec<i32>,
+    pub w_z: Vec<i32>,
+    pub w_b: Vec<i32>,
+    pub w_a: Vec<i32>,
+    pub conv: Vec<i32>,
+    pub a_exp: Vec<i32>,
+    pub dt_bias: Vec<i32>,
+    pub gnorm: Vec<i32>,
+    pub w_out: Vec<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mixer {
+    Attention(Attention),
+    Delta(Delta),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layer {
+    pub norm1: Vec<i32>,
+    pub mixer: Mixer,
+    pub norm2: Vec<i32>,
+    pub w_gate: Vec<i32>,
+    pub w_up: Vec<i32>,
+    pub w_down: Vec<i32>,
+}
+
+pub const CLASS_LETTER: u32 = 1;
+pub const CLASS_MARK: u32 = 2;
+pub const CLASS_NUMBER: u32 = 3;
+pub const CLASS_SPACE: u32 = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Vocab {
+    Scored { byte_base: u32, ranks: Vec<u32> },
+    Bpe { special: Vec<bool>, merges: Vec<[u32; 3]>, byte_tokens: Vec<u32>, classes: Vec<[u32; 3]> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Model {
     pub dim: usize,
     pub hidden_dim: usize,
-    pub n_layers: usize,
-    pub n_heads: usize,
     pub vocab_size: usize,
     pub seq_len: usize,
-    pub bos_id: u32,
-    pub eos_id: u32,
-    pub byte_base: u32,
+    pub rms_eps_q32: u32,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub rotary_dim: usize,
+    /// RoPE pairs are `(i, i + rotary_dim / 2)` if true, `(2i, 2i + 1)` otherwise.
+    pub rope_halves: bool,
+    pub qk_norm: bool,
+    pub out_gate: bool,
+    pub lin_heads: usize,
+    pub lin_k_dim: usize,
+    pub lin_v_dim: usize,
+    pub conv_kernel: usize,
+    pub echo_prompt: bool,
+    pub trim_prompt: bool,
     pub tok_emb: Vec<i32>,
     pub layers: Vec<Layer>,
-    pub rms_final: Vec<i32>,
+    pub final_norm: Vec<i32>,
     pub rope_cos: Vec<i32>,
     pub rope_sin: Vec<i32>,
     /// `None` means the classifier shares `tok_emb`.
     pub wcls: Option<Vec<i32>>,
     pub tokens: Vec<Vec<u8>>,
-    pub ranks: Vec<u32>,
+    pub vocab: Vocab,
+    pub prefix: Vec<u32>,
+    pub suffix: Vec<u32>,
+    pub stop: Vec<u32>,
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+struct Reader<R: Read> {
+    inner: R,
+    buf: Vec<u8>,
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if n > self.bytes.len() - self.pos {
-            return err("model file is truncated");
-        }
-        let s = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
+impl<R: Read> Reader<R> {
+    fn fill(&mut self, out: &mut [u8]) -> Result<()> {
+        self.inner.read_exact(out).map_err(|e| Error(format!("cannot read model: {e}")))
     }
 
     fn u32(&mut self) -> Result<u32> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        let mut b = [0u8; 4];
+        self.fill(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn bytes(&mut self, n: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; n];
+        self.fill(&mut out)?;
+        Ok(out)
     }
 
     fn i32s(&mut self, n: usize) -> Result<Vec<i32>> {
-        let Some(len) = n.checked_mul(4) else {
-            return err("tensor size overflows");
-        };
-        let b = self.take(len)?;
-        Ok(b.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect())
+        const CHUNK: usize = 1 << 18;
+        let mut out = Vec::new();
+        out.try_reserve_exact(n).map_err(|_| Error("model does not fit in memory".into()))?;
+        self.buf.resize(CHUNK * 4, 0);
+        let mut buf = std::mem::take(&mut self.buf);
+        let mut left = n;
+        while left > 0 {
+            let take = left.min(CHUNK);
+            self.fill(&mut buf[..take * 4])?;
+            out.extend(buf[..take * 4].as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)));
+            left -= take;
+        }
+        self.buf = buf;
+        Ok(out)
+    }
+
+    fn ids(&mut self, limit: usize) -> Result<Vec<u32>> {
+        let n = self.u32()? as usize;
+        if n > limit {
+            return err("token list is too long");
+        }
+        (0..n).map(|_| self.u32()).collect()
+    }
+
+    fn flag(&mut self, name: &str) -> Result<bool> {
+        match self.u32()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => err(format!("invalid {name} flag {other}")),
+        }
     }
 }
 
@@ -104,224 +197,446 @@ fn put_i32s(out: &mut Vec<u8>, values: &[i32]) {
     }
 }
 
+fn put_ids(out: &mut Vec<u8>, ids: &[u32]) {
+    put_u32(out, ids.len() as u32);
+    for &id in ids {
+        put_u32(out, id);
+    }
+}
+
+fn mul(a: usize, b: usize) -> Result<usize> {
+    a.checked_mul(b).ok_or(Error("tensor size overflows".into()))
+}
+
+fn check(name: &str, len: usize, want: usize) -> Result<()> {
+    if len == want {
+        Ok(())
+    } else {
+        err(format!("{name} has {len} elements, expected {want}"))
+    }
+}
+
 impl Model {
-    pub fn head_size(&self) -> usize {
-        self.dim / self.n_heads
+    pub fn q_rows(&self) -> usize {
+        self.n_heads * self.head_dim * (1 + self.out_gate as usize)
     }
 
-    /// First id of the regular (mergeable) tokens.
-    pub fn first_regular(&self) -> u32 {
-        self.byte_base + 256
+    pub fn kv_rows(&self) -> usize {
+        self.n_kv_heads * self.head_dim
+    }
+
+    pub fn att_out(&self) -> usize {
+        self.n_heads * self.head_dim
+    }
+
+    pub fn lin_k(&self) -> usize {
+        self.lin_heads * self.lin_k_dim
+    }
+
+    pub fn lin_v(&self) -> usize {
+        self.lin_heads * self.lin_v_dim
+    }
+
+    pub fn conv_dim(&self) -> usize {
+        2 * self.lin_k() + self.lin_v()
     }
 
     pub fn classifier(&self) -> &[i32] {
         self.wcls.as_deref().unwrap_or(&self.tok_emb)
     }
 
-    /// Check every structural invariant the engine relies on.
-    pub fn validate(&self) -> Result<()> {
+    /// Check the header fields. Run before any size is derived from them.
+    fn validate_header(&self, n_layers: usize) -> Result<()> {
         let limits = [
-            ("dim", self.dim, 1 << 16),
-            ("hidden_dim", self.hidden_dim, 1 << 20),
-            ("n_layers", self.n_layers, 1 << 10),
-            ("n_heads", self.n_heads, 1 << 10),
-            ("vocab_size", self.vocab_size, 1 << 24),
-            ("seq_len", self.seq_len, 1 << 20),
+            ("dim", self.dim, 1, 1 << 16),
+            ("hidden_dim", self.hidden_dim, 1, 1 << 20),
+            ("n_layers", n_layers, 1, 1 << 10),
+            ("vocab_size", self.vocab_size, 1, 1 << 24),
+            ("seq_len", self.seq_len, 1, 1 << 20),
+            ("n_heads", self.n_heads, 1, 1 << 10),
+            ("n_kv_heads", self.n_kv_heads, 1, 1 << 10),
+            ("head_dim", self.head_dim, 2, 1 << 14),
+            ("rotary_dim", self.rotary_dim, 2, 1 << 14),
+            ("lin_heads", self.lin_heads, 0, 1 << 10),
+            ("lin_k_dim", self.lin_k_dim, 0, 1 << 12),
+            ("lin_v_dim", self.lin_v_dim, 0, 1 << 12),
+            ("conv_kernel", self.conv_kernel, 0, 64),
         ];
-        for (name, value, max) in limits {
-            if value == 0 || value > max {
-                return err(format!("{name} = {value} is outside 1..={max}"));
+        for (name, value, min, max) in limits {
+            if value < min || value > max {
+                return err(format!("{name} = {value} is outside {min}..={max}"));
             }
         }
-        if !self.dim.is_multiple_of(self.n_heads) {
-            return err("dim is not a multiple of n_heads");
+        if !self.n_heads.is_multiple_of(self.n_kv_heads) {
+            return err("n_heads is not a multiple of n_kv_heads");
         }
-        let hs = self.head_size();
-        if !hs.is_multiple_of(2) {
-            return err("head size is odd");
+        if !self.rotary_dim.is_multiple_of(2) || self.rotary_dim > self.head_dim {
+            return err("rotary_dim must be even and at most head_dim");
         }
-        let (d, h, v) = (self.dim, self.hidden_dim, self.vocab_size);
-        let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(crate::Error("size overflow".into()));
-        let check = |name: &str, len: usize, want: usize| {
-            if len == want {
-                Ok(())
-            } else {
-                err(format!("{name} has {len} elements, expected {want}"))
-            }
-        };
-        check("tok_emb", self.tok_emb.len(), mul(v, d)?)?;
-        check("layers", self.layers.len(), self.n_layers)?;
-        for l in &self.layers {
-            check("rms_att", l.rms_att.len(), d)?;
-            check("wq", l.wq.len(), mul(d, d)?)?;
-            check("wk", l.wk.len(), mul(d, d)?)?;
-            check("wv", l.wv.len(), mul(d, d)?)?;
-            check("wo", l.wo.len(), mul(d, d)?)?;
-            check("rms_ffn", l.rms_ffn.len(), d)?;
-            check("w1", l.w1.len(), mul(h, d)?)?;
-            check("w2", l.w2.len(), mul(d, h)?)?;
-            check("w3", l.w3.len(), mul(h, d)?)?;
-        }
-        check("rms_final", self.rms_final.len(), d)?;
-        check("rope_cos", self.rope_cos.len(), mul(self.seq_len, hs / 2)?)?;
-        check("rope_sin", self.rope_sin.len(), mul(self.seq_len, hs / 2)?)?;
-        if let Some(w) = &self.wcls {
-            check("wcls", w.len(), mul(v, d)?)?;
-        }
-        check("tokens", self.tokens.len(), v)?;
-        check("ranks", self.ranks.len(), v)?;
-        if self.bos_id as usize >= v || self.eos_id as usize >= v {
-            return err("bos_id or eos_id is outside the vocabulary");
-        }
-        if self.bos_id >= self.byte_base || self.eos_id >= self.byte_base {
-            return err("bos_id and eos_id must be special tokens (below byte_base)");
-        }
-        if self.byte_base as usize + 256 > v {
-            return err("byte tokens do not fit in the vocabulary");
-        }
-        for b in 0..256usize {
-            if self.tokens[self.byte_base as usize + b] != [b as u8] {
-                return err(format!("byte token {b} does not hold its byte"));
-            }
-        }
-        for t in &self.tokens {
-            if t.len() > 1 << 16 {
-                return err("token is longer than 65536 bytes");
-            }
+        if self.rms_eps_q32 == 0 {
+            return err("rms_eps_q32 must not be zero");
         }
         Ok(())
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Model> {
-        let mut r = Reader { bytes, pos: 0 };
-        if r.take(4)? != MAGIC {
+    /// Check every structural invariant the engine relies on.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_header(self.layers.len())?;
+        let (d, h, v) = (self.dim, self.hidden_dim, self.vocab_size);
+        check("tok_emb", self.tok_emb.len(), mul(v, d)?)?;
+        for l in &self.layers {
+            check("norm1", l.norm1.len(), d)?;
+            match &l.mixer {
+                Mixer::Attention(a) => {
+                    check("wq", a.wq.len(), mul(self.q_rows(), d)?)?;
+                    check("wk", a.wk.len(), mul(self.kv_rows(), d)?)?;
+                    check("wv", a.wv.len(), mul(self.kv_rows(), d)?)?;
+                    check("wo", a.wo.len(), mul(d, self.att_out())?)?;
+                    let norm = if self.qk_norm { self.head_dim } else { 0 };
+                    check("q_norm", a.q_norm.len(), norm)?;
+                    check("k_norm", a.k_norm.len(), norm)?;
+                }
+                Mixer::Delta(g) => {
+                    if self.lin_heads == 0 || self.lin_k_dim == 0 || self.lin_v_dim == 0 || self.conv_kernel == 0 {
+                        return err("gated delta layer present but its dimensions are zero");
+                    }
+                    check("w_qkv", g.w_qkv.len(), mul(self.conv_dim(), d)?)?;
+                    check("w_z", g.w_z.len(), mul(self.lin_v(), d)?)?;
+                    check("w_b", g.w_b.len(), mul(self.lin_heads, d)?)?;
+                    check("w_a", g.w_a.len(), mul(self.lin_heads, d)?)?;
+                    check("conv", g.conv.len(), mul(self.conv_dim(), self.conv_kernel)?)?;
+                    check("a_exp", g.a_exp.len(), self.lin_heads)?;
+                    check("dt_bias", g.dt_bias.len(), self.lin_heads)?;
+                    check("gnorm", g.gnorm.len(), self.lin_v_dim)?;
+                    check("w_out", g.w_out.len(), mul(d, self.lin_v())?)?;
+                }
+            }
+            check("norm2", l.norm2.len(), d)?;
+            check("w_gate", l.w_gate.len(), mul(h, d)?)?;
+            check("w_up", l.w_up.len(), mul(h, d)?)?;
+            check("w_down", l.w_down.len(), mul(d, h)?)?;
+        }
+        check("final_norm", self.final_norm.len(), d)?;
+        let rope = mul(self.seq_len, self.rotary_dim / 2)?;
+        check("rope_cos", self.rope_cos.len(), rope)?;
+        check("rope_sin", self.rope_sin.len(), rope)?;
+        if let Some(w) = &self.wcls {
+            check("wcls", w.len(), mul(v, d)?)?;
+        }
+        check("tokens", self.tokens.len(), v)?;
+        if self.tokens.iter().any(|t| t.len() > 1 << 16) {
+            return err("token is longer than 65536 bytes");
+        }
+        match &self.vocab {
+            Vocab::Scored { byte_base, ranks } => {
+                check("ranks", ranks.len(), v)?;
+                if *byte_base as usize + 256 > v {
+                    return err("byte tokens do not fit in the vocabulary");
+                }
+                for b in 0..256usize {
+                    if self.tokens[*byte_base as usize + b] != [b as u8] {
+                        return err(format!("byte token {b} does not hold its byte"));
+                    }
+                }
+            }
+            Vocab::Bpe { special, merges, byte_tokens, classes } => {
+                check("special", special.len(), v)?;
+                check("byte_tokens", byte_tokens.len(), 256)?;
+                for (b, &id) in byte_tokens.iter().enumerate() {
+                    if self.tokens.get(id as usize).map(Vec::as_slice) != Some(&[b as u8]) {
+                        return err(format!("byte token {b} does not hold its byte"));
+                    }
+                }
+                if merges.iter().flatten().any(|&id| id as usize >= v) {
+                    return err("merge refers to a token outside the vocabulary");
+                }
+                let mut next = 0u32;
+                for &[first, last, class] in classes {
+                    if first < next || last < first || !(1..=4).contains(&class) || last > 0x10FFFF {
+                        return err("character class ranges are not sorted, disjoint and valid");
+                    }
+                    next = last + 1;
+                }
+            }
+        }
+        if self.prefix.iter().chain(&self.suffix).chain(&self.stop).any(|&id| id as usize >= v) {
+            return err("prompt template refers to a token outside the vocabulary");
+        }
+        Ok(())
+    }
+
+    pub fn from_bytes(mut bytes: &[u8]) -> Result<Model> {
+        Model::read(&mut bytes)
+    }
+
+    /// Read a model from a stream. The stream must end exactly where the model ends.
+    pub fn read(inner: impl Read) -> Result<Model> {
+        let mut r = Reader { inner, buf: Vec::new() };
+        if r.bytes(4)? != MAGIC {
             return err("not a DLLM model file");
         }
         let version = r.u32()?;
         if version != VERSION {
-            return err(format!("unsupported model version {version}"));
+            return err(format!("unsupported model version {version} (expected {VERSION})"));
         }
-        let dim = r.u32()? as usize;
-        let hidden_dim = r.u32()? as usize;
-        let n_layers = r.u32()? as usize;
-        let n_heads = r.u32()? as usize;
-        let vocab_size = r.u32()? as usize;
-        let seq_len = r.u32()? as usize;
-        let bos_id = r.u32()?;
-        let eos_id = r.u32()?;
-        let byte_base = r.u32()?;
-        let shared = match r.u32()? {
-            0 => false,
-            1 => true,
-            other => return err(format!("invalid shared_classifier flag {other}")),
+        let mut m = Model {
+            dim: r.u32()? as usize,
+            hidden_dim: r.u32()? as usize,
+            vocab_size: 0,
+            seq_len: 0,
+            rms_eps_q32: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            rotary_dim: 0,
+            rope_halves: false,
+            qk_norm: false,
+            out_gate: false,
+            lin_heads: 0,
+            lin_k_dim: 0,
+            lin_v_dim: 0,
+            conv_kernel: 0,
+            echo_prompt: false,
+            trim_prompt: false,
+            tok_emb: Vec::new(),
+            layers: Vec::new(),
+            final_norm: Vec::new(),
+            rope_cos: Vec::new(),
+            rope_sin: Vec::new(),
+            wcls: None,
+            tokens: Vec::new(),
+            vocab: Vocab::Scored { byte_base: 0, ranks: Vec::new() },
+            prefix: Vec::new(),
+            suffix: Vec::new(),
+            stop: Vec::new(),
         };
-        // Reject absurd headers before sizing any allocation from them.
-        for (name, value, max) in [
-            ("dim", dim, 1usize << 16),
-            ("hidden_dim", hidden_dim, 1 << 20),
-            ("n_layers", n_layers, 1 << 10),
-            ("n_heads", n_heads, 1 << 10),
-            ("vocab_size", vocab_size, 1 << 24),
-            ("seq_len", seq_len, 1 << 20),
-        ] {
-            if value == 0 || value > max {
-                return err(format!("{name} = {value} is outside 1..={max}"));
-            }
-        }
-        if !dim.is_multiple_of(n_heads) {
-            return err("dim is not a multiple of n_heads");
-        }
-        let half_head = dim / n_heads / 2;
-        let sz = |a: usize, b: usize| a.checked_mul(b).ok_or(crate::Error("size overflow".into()));
+        let n_layers = r.u32()? as usize;
+        m.vocab_size = r.u32()? as usize;
+        m.seq_len = r.u32()? as usize;
+        m.rms_eps_q32 = r.u32()?;
+        m.n_heads = r.u32()? as usize;
+        m.n_kv_heads = r.u32()? as usize;
+        m.head_dim = r.u32()? as usize;
+        m.rotary_dim = r.u32()? as usize;
+        m.rope_halves = r.flag("rope_halves")?;
+        m.qk_norm = r.flag("qk_norm")?;
+        m.out_gate = r.flag("out_gate")?;
+        m.lin_heads = r.u32()? as usize;
+        m.lin_k_dim = r.u32()? as usize;
+        m.lin_v_dim = r.u32()? as usize;
+        m.conv_kernel = r.u32()? as usize;
+        let shared = r.flag("shared_classifier")?;
+        let tokenizer_kind = r.u32()?;
+        m.echo_prompt = r.flag("echo_prompt")?;
+        m.trim_prompt = r.flag("trim_prompt")?;
+        m.validate_header(n_layers)?;
+        let layer_types = (0..n_layers).map(|_| r.u32()).collect::<Result<Vec<u32>>>()?;
 
-        let tok_emb = r.i32s(sz(vocab_size, dim)?)?;
-        let mut layers = Vec::new();
-        for _ in 0..n_layers {
-            layers.push(Layer {
-                rms_att: r.i32s(dim)?,
-                wq: r.i32s(sz(dim, dim)?)?,
-                wk: r.i32s(sz(dim, dim)?)?,
-                wv: r.i32s(sz(dim, dim)?)?,
-                wo: r.i32s(sz(dim, dim)?)?,
-                rms_ffn: r.i32s(dim)?,
-                w1: r.i32s(sz(hidden_dim, dim)?)?,
-                w2: r.i32s(sz(dim, hidden_dim)?)?,
-                w3: r.i32s(sz(hidden_dim, dim)?)?,
+        let (d, h, v) = (m.dim, m.hidden_dim, m.vocab_size);
+        m.tok_emb = r.i32s(mul(v, d)?)?;
+        for layer_type in layer_types {
+            let norm1 = r.i32s(d)?;
+            let mixer = match layer_type {
+                0 => {
+                    let norm = if m.qk_norm { m.head_dim } else { 0 };
+                    Mixer::Attention(Attention {
+                        wq: r.i32s(mul(m.q_rows(), d)?)?,
+                        wk: r.i32s(mul(m.kv_rows(), d)?)?,
+                        wv: r.i32s(mul(m.kv_rows(), d)?)?,
+                        wo: r.i32s(mul(d, m.att_out())?)?,
+                        q_norm: r.i32s(norm)?,
+                        k_norm: r.i32s(norm)?,
+                    })
+                }
+                1 => Mixer::Delta(Delta {
+                    w_qkv: r.i32s(mul(m.conv_dim(), d)?)?,
+                    w_z: r.i32s(mul(m.lin_v(), d)?)?,
+                    w_b: r.i32s(mul(m.lin_heads, d)?)?,
+                    w_a: r.i32s(mul(m.lin_heads, d)?)?,
+                    conv: r.i32s(mul(m.conv_dim(), m.conv_kernel)?)?,
+                    a_exp: r.i32s(m.lin_heads)?,
+                    dt_bias: r.i32s(m.lin_heads)?,
+                    gnorm: r.i32s(m.lin_v_dim)?,
+                    w_out: r.i32s(mul(d, m.lin_v())?)?,
+                }),
+                other => return err(format!("unknown layer type {other}")),
+            };
+            m.layers.push(Layer {
+                norm1,
+                mixer,
+                norm2: r.i32s(d)?,
+                w_gate: r.i32s(mul(h, d)?)?,
+                w_up: r.i32s(mul(h, d)?)?,
+                w_down: r.i32s(mul(d, h)?)?,
             });
         }
-        let rms_final = r.i32s(dim)?;
-        let rope_cos = r.i32s(sz(seq_len, half_head)?)?;
-        let rope_sin = r.i32s(sz(seq_len, half_head)?)?;
-        let wcls = if shared { None } else { Some(r.i32s(sz(vocab_size, dim)?)?) };
-        let mut tokens = Vec::new();
-        let mut ranks = Vec::new();
-        for _ in 0..vocab_size {
-            ranks.push(r.u32()?);
+        m.final_norm = r.i32s(d)?;
+        let rope = mul(m.seq_len, m.rotary_dim / 2)?;
+        m.rope_cos = r.i32s(rope)?;
+        m.rope_sin = r.i32s(rope)?;
+        if !shared {
+            m.wcls = Some(r.i32s(mul(v, d)?)?);
+        }
+
+        let token = |r: &mut Reader<_>| -> Result<(u32, Vec<u8>)> {
+            let field = r.u32()?;
             let len = r.u32()? as usize;
-            tokens.push(r.take(len)?.to_vec());
-        }
-        if r.pos != bytes.len() {
-            return err("trailing bytes after the end of the model");
-        }
-        let model = Model {
-            dim,
-            hidden_dim,
-            n_layers,
-            n_heads,
-            vocab_size,
-            seq_len,
-            bos_id,
-            eos_id,
-            byte_base,
-            tok_emb,
-            layers,
-            rms_final,
-            rope_cos,
-            rope_sin,
-            wcls,
-            tokens,
-            ranks,
+            if len > 1 << 16 {
+                return err("token is longer than 65536 bytes");
+            }
+            Ok((field, r.bytes(len)?))
         };
-        model.validate()?;
-        Ok(model)
+        m.vocab = match tokenizer_kind {
+            0 => {
+                let byte_base = r.u32()?;
+                let mut ranks = Vec::new();
+                for _ in 0..v {
+                    let (rank, bytes) = token(&mut r)?;
+                    ranks.push(rank);
+                    m.tokens.push(bytes);
+                }
+                Vocab::Scored { byte_base, ranks }
+            }
+            1 => {
+                let mut special = Vec::new();
+                for _ in 0..v {
+                    let (flag, bytes) = token(&mut r)?;
+                    if flag > 1 {
+                        return err("invalid special-token flag");
+                    }
+                    special.push(flag == 1);
+                    m.tokens.push(bytes);
+                }
+                let n_merges = r.u32()? as usize;
+                if n_merges > 1 << 24 {
+                    return err("too many merges");
+                }
+                let mut merges = Vec::new();
+                for _ in 0..n_merges {
+                    merges.push([r.u32()?, r.u32()?, r.u32()?]);
+                }
+                let byte_tokens = (0..256).map(|_| r.u32()).collect::<Result<Vec<u32>>>()?;
+                let n_ranges = r.u32()? as usize;
+                if n_ranges > 1 << 20 {
+                    return err("too many character class ranges");
+                }
+                let mut classes = Vec::new();
+                for _ in 0..n_ranges {
+                    classes.push([r.u32()?, r.u32()?, r.u32()?]);
+                }
+                Vocab::Bpe { special, merges, byte_tokens, classes }
+            }
+            other => return err(format!("unknown tokenizer kind {other}")),
+        };
+        m.prefix = r.ids(1 << 16)?;
+        m.suffix = r.ids(1 << 16)?;
+        m.stop = r.ids(1 << 16)?;
+        let mut probe = [0u8; 1];
+        match r.inner.read(&mut probe) {
+            Ok(0) => {}
+            Ok(_) => return err("trailing bytes after the end of the model"),
+            Err(e) => return err(format!("cannot read model: {e}")),
+        }
+        m.validate()?;
+        Ok(m)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);
+        let tokenizer_kind = match self.vocab {
+            Vocab::Scored { .. } => 0,
+            Vocab::Bpe { .. } => 1,
+        };
         for v in [
             VERSION,
             self.dim as u32,
             self.hidden_dim as u32,
-            self.n_layers as u32,
-            self.n_heads as u32,
+            self.layers.len() as u32,
             self.vocab_size as u32,
             self.seq_len as u32,
-            self.bos_id,
-            self.eos_id,
-            self.byte_base,
+            self.rms_eps_q32,
+            self.n_heads as u32,
+            self.n_kv_heads as u32,
+            self.head_dim as u32,
+            self.rotary_dim as u32,
+            self.rope_halves as u32,
+            self.qk_norm as u32,
+            self.out_gate as u32,
+            self.lin_heads as u32,
+            self.lin_k_dim as u32,
+            self.lin_v_dim as u32,
+            self.conv_kernel as u32,
             self.wcls.is_none() as u32,
+            tokenizer_kind,
+            self.echo_prompt as u32,
+            self.trim_prompt as u32,
         ] {
             put_u32(&mut out, v);
         }
+        for l in &self.layers {
+            put_u32(&mut out, matches!(l.mixer, Mixer::Delta(_)) as u32);
+        }
         put_i32s(&mut out, &self.tok_emb);
         for l in &self.layers {
-            for t in [&l.rms_att, &l.wq, &l.wk, &l.wv, &l.wo, &l.rms_ffn, &l.w1, &l.w2, &l.w3] {
+            put_i32s(&mut out, &l.norm1);
+            match &l.mixer {
+                Mixer::Attention(a) => {
+                    for t in [&a.wq, &a.wk, &a.wv, &a.wo, &a.q_norm, &a.k_norm] {
+                        put_i32s(&mut out, t);
+                    }
+                }
+                Mixer::Delta(g) => {
+                    for t in [
+                        &g.w_qkv, &g.w_z, &g.w_b, &g.w_a, &g.conv, &g.a_exp, &g.dt_bias, &g.gnorm,
+                        &g.w_out,
+                    ] {
+                        put_i32s(&mut out, t);
+                    }
+                }
+            }
+            for t in [&l.norm2, &l.w_gate, &l.w_up, &l.w_down] {
                 put_i32s(&mut out, t);
             }
         }
-        put_i32s(&mut out, &self.rms_final);
+        put_i32s(&mut out, &self.final_norm);
         put_i32s(&mut out, &self.rope_cos);
         put_i32s(&mut out, &self.rope_sin);
         if let Some(w) = &self.wcls {
             put_i32s(&mut out, w);
         }
-        for (token, rank) in self.tokens.iter().zip(&self.ranks) {
-            put_u32(&mut out, *rank);
-            put_u32(&mut out, token.len() as u32);
-            out.extend_from_slice(token);
+        match &self.vocab {
+            Vocab::Scored { byte_base, ranks } => {
+                put_u32(&mut out, *byte_base);
+                for (token, rank) in self.tokens.iter().zip(ranks) {
+                    put_u32(&mut out, *rank);
+                    put_u32(&mut out, token.len() as u32);
+                    out.extend_from_slice(token);
+                }
+            }
+            Vocab::Bpe { special, merges, byte_tokens, classes } => {
+                for (token, flag) in self.tokens.iter().zip(special) {
+                    put_u32(&mut out, *flag as u32);
+                    put_u32(&mut out, token.len() as u32);
+                    out.extend_from_slice(token);
+                }
+                put_u32(&mut out, merges.len() as u32);
+                for v in merges.iter().flatten() {
+                    put_u32(&mut out, *v);
+                }
+                for v in byte_tokens {
+                    put_u32(&mut out, *v);
+                }
+                put_u32(&mut out, classes.len() as u32);
+                for v in classes.iter().flatten() {
+                    put_u32(&mut out, *v);
+                }
+            }
         }
+        put_ids(&mut out, &self.prefix);
+        put_ids(&mut out, &self.suffix);
+        put_ids(&mut out, &self.stop);
         Ok(out)
     }
 }

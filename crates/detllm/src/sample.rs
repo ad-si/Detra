@@ -1,6 +1,6 @@
 //! Token selection. Greedy, or seeded sampling done entirely in integers.
 
-use crate::fixed::{exp_neg, ONE_Q16};
+use crate::fixed::{exp_neg, ACT_FRAC, ONE_Q16};
 
 /// SplitMix64. The stream is a pure function of the seed.
 pub struct Rng(u64);
@@ -61,7 +61,8 @@ pub fn argmax(logits: &[i32]) -> u32 {
 /// Pick the next token.
 ///
 /// 1. Order tokens by (logit descending, id ascending); keep the first `top_k`.
-/// 2. Weight of token i: `exp_neg((logit_i - logit_max) * 2^16 / temperature)` (Q30).
+/// 2. Weight of token i: `exp(-((logit_max - logit_i) * 2^16 / temperature))` (Q30).
+///    Logits are Q20 and the temperature is Q16.
 /// 3. Keep the shortest prefix whose weight sum `c` satisfies
 ///    `c * 2^16 >= top_p * total`.
 /// 4. Draw `r` uniformly below the kept sum and take the first token whose cumulative
@@ -81,8 +82,8 @@ pub fn sample(logits: &[i32], p: &SampleParams, rng: &mut Rng) -> u32 {
     let mut weights: Vec<u64> = order
         .iter()
         .map(|&id| {
-            let diff = logits[id as usize] as i64 - max;
-            exp_neg(diff * ONE_Q16 / p.temperature_q16) as u64
+            let diff = max - logits[id as usize] as i64;
+            exp_neg(diff * ONE_Q16 / p.temperature_q16, ACT_FRAC) as u64
         })
         .collect();
     // The first weight is exactly 2^30, so the total is never zero.
@@ -133,7 +134,7 @@ mod tests {
 
     #[test]
     fn sampling_respects_filters() {
-        let logits = [0, 10 << 16, 9 << 16, -(5 << 16)];
+        let logits = [0, 10 << 20, 9 << 20, -(5 << 20)];
         let mut rng = Rng::new(7);
         let top1 = SampleParams { temperature_q16: ONE_Q16, top_k: 1, top_p_q16: ONE_Q16, seed: 7 };
         let tiny_p = SampleParams { temperature_q16: ONE_Q16, top_k: 0, top_p_q16: 1, seed: 7 };

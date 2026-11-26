@@ -15,6 +15,7 @@ pub mod engine;
 pub mod fixed;
 pub mod generate;
 pub mod model;
+pub mod pool;
 pub mod sample;
 pub mod sha256;
 pub mod tokenizer;

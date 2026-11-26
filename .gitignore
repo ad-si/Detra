@@ -2,3 +2,4 @@
 /models/*.bin
 /models/*.dllm
 /.claude/settings.local.json
+/models/qwen3.5-0.8b/

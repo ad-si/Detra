@@ -8,6 +8,9 @@ use crate::tokenizer::Tokenizer;
 use crate::{err, Result};
 use std::sync::Arc;
 
+/// Number of prompt positions processed per forward call. Affects speed only.
+const PROMPT_BLOCK: usize = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GenParams {
     pub max_new_tokens: usize,
@@ -73,29 +76,34 @@ pub fn generate(
         ));
     }
     let prompt_len = tokens.len();
+    let dim = model.dim;
     let mut session = Session::new(Arc::clone(model), params.threads);
     let mut rng = Rng::new(params.sample.seed);
+    // Logits are only needed where a token is going to be chosen.
+    let mut done = params.max_new_tokens == 0 || prompt_len >= model.seq_len;
+
+    // The prompt is fed in blocks; this gives the same result as token by token.
     let mut pos = 0;
-    loop {
-        let last = pos + 1 == tokens.len();
-        let done = tokens.len() - prompt_len >= params.max_new_tokens || pos + 1 >= model.seq_len;
-        let want_logits = last && !done;
-        session.step(tokens[pos], want_logits)?;
-        pos += 1;
-        // The logits live in the session; borrow them again together with the hidden state.
-        let logits = session.logits();
-        observe(Step { hidden: session.hidden(), logits });
-        if !last {
-            continue;
+    while pos < prompt_len {
+        let end = (pos + PROMPT_BLOCK).min(prompt_len);
+        let want_logits = end == prompt_len && !done;
+        session.feed(&tokens[pos..end], want_logits)?;
+        let last = end - pos - 1;
+        for (i, hidden) in session.hidden().chunks_exact(dim).enumerate() {
+            let logits = if i == last { session.logits() } else { &[] };
+            observe(Step { hidden, logits });
         }
-        if done {
-            break;
-        }
-        let next = sample(logits, &params.sample, &mut rng);
+        pos = end;
+    }
+    while !done {
+        let next = sample(session.logits(), &params.sample, &mut rng);
         if model.stop.contains(&next) {
             break;
         }
         tokens.push(next);
+        done = tokens.len() - prompt_len >= params.max_new_tokens || tokens.len() >= model.seq_len;
+        session.step(next, !done)?;
+        observe(Step { hidden: session.hidden(), logits: session.logits() });
     }
     Ok(Output { tokens, text: text_range, generated_from: prompt_len })
 }

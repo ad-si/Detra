@@ -1,4 +1,5 @@
-//! Model file format (`.dllm`, version 2). All integers are little-endian `u32`/`i32`.
+//! Model file format (`.dllm`, version 3). Integers are little-endian `u32`/`i32`
+//! unless noted.
 //!
 //! ```text
 //! magic "DLLM"
@@ -25,7 +26,13 @@
 //! prefix, suffix, stop: each `u32 count` followed by that many token ids
 //! ```
 //!
-//! All tensors are `i32` in Q24 unless noted, matrices row-major `[rows, cols]`.
+//! All tensors hold Q24 values unless noted, matrices row-major `[rows, cols]`.
+//! Vectors (norm weights, `conv`, `a_exp`, `dt_bias`, RoPE tables) are plain `i32`.
+//! Every matrix (`tok_emb`, `wcls` and all `w*` tensors) starts with a `u32` encoding:
+//! 0 = `i32` values; 1 = packed `i16` values, where `p` stands for the value
+//! `(p >> 5) << (p & 31)` (arithmetic right shift, then a left shift in 32 bits).
+//! Packing is lossless for the values it is used for and only saves space and time:
+//! the two encodings of the same values give the same results.
 //! `q_rows = n_heads * head_dim * (1 + out_gate)`, `kv_rows = n_kv_heads * head_dim`,
 //! `K = lin_heads * lin_k_dim`, `V = lin_heads * lin_v_dim`.
 //! Norm weights are the effective multipliers (any `1 + w` is already applied).
@@ -44,29 +51,87 @@ use crate::{err, Error, Result};
 use std::io::Read;
 
 pub const MAGIC: [u8; 4] = *b"DLLM";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+
+/// A matrix of Q24 values in one of the two encodings of the file format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Tensor {
+    Wide(Vec<i32>),
+    Packed(Vec<i16>),
+}
+
+impl Tensor {
+    /// The value a packed element stands for.
+    #[inline(always)]
+    pub fn unpack(p: i16) -> i32 {
+        ((p >> 5) as i32) << (p & 31)
+    }
+
+    /// The packed form of `v`, if it has one: an 11-bit signed mantissa times a power
+    /// of two.
+    fn pack_value(v: i32) -> Option<i16> {
+        if v == 0 {
+            return Some(0);
+        }
+        let shift = v.trailing_zeros();
+        let mantissa = v >> shift;
+        (-1024..=1023).contains(&mantissa).then_some(((mantissa << 5) | shift as i32) as i16)
+    }
+
+    /// Store `values` packed if every one of them can be, otherwise as they are.
+    pub fn pack(values: Vec<i32>) -> Tensor {
+        match values.iter().map(|&v| Tensor::pack_value(v)).collect::<Option<Vec<i16>>>() {
+            Some(packed) => Tensor::Packed(packed),
+            None => Tensor::Wide(values),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Tensor::Wide(v) => v.len(),
+            Tensor::Packed(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, i: usize) -> i32 {
+        match self {
+            Tensor::Wide(v) => v[i],
+            Tensor::Packed(v) => Tensor::unpack(v[i]),
+        }
+    }
+}
+
+impl From<Vec<i32>> for Tensor {
+    fn from(values: Vec<i32>) -> Tensor {
+        Tensor::Wide(values)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attention {
-    pub wq: Vec<i32>,
-    pub wk: Vec<i32>,
-    pub wv: Vec<i32>,
-    pub wo: Vec<i32>,
+    pub wq: Tensor,
+    pub wk: Tensor,
+    pub wv: Tensor,
+    pub wo: Tensor,
     pub q_norm: Vec<i32>,
     pub k_norm: Vec<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delta {
-    pub w_qkv: Vec<i32>,
-    pub w_z: Vec<i32>,
-    pub w_b: Vec<i32>,
-    pub w_a: Vec<i32>,
+    pub w_qkv: Tensor,
+    pub w_z: Tensor,
+    pub w_b: Tensor,
+    pub w_a: Tensor,
     pub conv: Vec<i32>,
     pub a_exp: Vec<i32>,
     pub dt_bias: Vec<i32>,
     pub gnorm: Vec<i32>,
-    pub w_out: Vec<i32>,
+    pub w_out: Tensor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,9 +145,9 @@ pub struct Layer {
     pub norm1: Vec<i32>,
     pub mixer: Mixer,
     pub norm2: Vec<i32>,
-    pub w_gate: Vec<i32>,
-    pub w_up: Vec<i32>,
-    pub w_down: Vec<i32>,
+    pub w_gate: Tensor,
+    pub w_up: Tensor,
+    pub w_down: Tensor,
 }
 
 pub const CLASS_LETTER: u32 = 1;
@@ -117,13 +182,13 @@ pub struct Model {
     pub conv_kernel: usize,
     pub echo_prompt: bool,
     pub trim_prompt: bool,
-    pub tok_emb: Vec<i32>,
+    pub tok_emb: Tensor,
     pub layers: Vec<Layer>,
     pub final_norm: Vec<i32>,
     pub rope_cos: Vec<i32>,
     pub rope_sin: Vec<i32>,
     /// `None` means the classifier shares `tok_emb`.
-    pub wcls: Option<Vec<i32>>,
+    pub wcls: Option<Tensor>,
     pub tokens: Vec<Vec<u8>>,
     pub vocab: Vocab,
     pub prefix: Vec<u32>,
@@ -170,6 +235,27 @@ impl<R: Read> Reader<R> {
         Ok(out)
     }
 
+    fn tensor(&mut self, n: usize) -> Result<Tensor> {
+        match self.u32()? {
+            0 => Ok(Tensor::Wide(self.i32s(n)?)),
+            1 => {
+                const CHUNK: usize = 1 << 18;
+                let mut out = Vec::new();
+                out.try_reserve_exact(n).map_err(|_| Error("model does not fit in memory".into()))?;
+                let mut buf = vec![0u8; CHUNK * 2];
+                let mut left = n;
+                while left > 0 {
+                    let take = left.min(CHUNK);
+                    self.fill(&mut buf[..take * 2])?;
+                    out.extend(buf[..take * 2].as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)));
+                    left -= take;
+                }
+                Ok(Tensor::Packed(out))
+            }
+            other => err(format!("unknown tensor encoding {other}")),
+        }
+    }
+
     fn ids(&mut self, limit: usize) -> Result<Vec<u32>> {
         let n = self.u32()? as usize;
         if n > limit {
@@ -194,6 +280,21 @@ fn put_u32(out: &mut Vec<u8>, v: u32) {
 fn put_i32s(out: &mut Vec<u8>, values: &[i32]) {
     for v in values {
         out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn put_tensor(out: &mut Vec<u8>, tensor: &Tensor) {
+    match tensor {
+        Tensor::Wide(values) => {
+            put_u32(out, 0);
+            put_i32s(out, values);
+        }
+        Tensor::Packed(values) => {
+            put_u32(out, 1);
+            for v in values {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
     }
 }
 
@@ -241,8 +342,8 @@ impl Model {
         2 * self.lin_k() + self.lin_v()
     }
 
-    pub fn classifier(&self) -> &[i32] {
-        self.wcls.as_deref().unwrap_or(&self.tok_emb)
+    pub fn classifier(&self) -> &Tensor {
+        self.wcls.as_ref().unwrap_or(&self.tok_emb)
     }
 
     /// Check the header fields. Run before any size is derived from them.
@@ -402,7 +503,7 @@ impl Model {
             conv_kernel: 0,
             echo_prompt: false,
             trim_prompt: false,
-            tok_emb: Vec::new(),
+            tok_emb: Tensor::Wide(Vec::new()),
             layers: Vec::new(),
             final_norm: Vec::new(),
             rope_cos: Vec::new(),
@@ -437,31 +538,31 @@ impl Model {
         let layer_types = (0..n_layers).map(|_| r.u32()).collect::<Result<Vec<u32>>>()?;
 
         let (d, h, v) = (m.dim, m.hidden_dim, m.vocab_size);
-        m.tok_emb = r.i32s(mul(v, d)?)?;
+        m.tok_emb = r.tensor(mul(v, d)?)?;
         for layer_type in layer_types {
             let norm1 = r.i32s(d)?;
             let mixer = match layer_type {
                 0 => {
                     let norm = if m.qk_norm { m.head_dim } else { 0 };
                     Mixer::Attention(Attention {
-                        wq: r.i32s(mul(m.q_rows(), d)?)?,
-                        wk: r.i32s(mul(m.kv_rows(), d)?)?,
-                        wv: r.i32s(mul(m.kv_rows(), d)?)?,
-                        wo: r.i32s(mul(d, m.att_out())?)?,
+                        wq: r.tensor(mul(m.q_rows(), d)?)?,
+                        wk: r.tensor(mul(m.kv_rows(), d)?)?,
+                        wv: r.tensor(mul(m.kv_rows(), d)?)?,
+                        wo: r.tensor(mul(d, m.att_out())?)?,
                         q_norm: r.i32s(norm)?,
                         k_norm: r.i32s(norm)?,
                     })
                 }
                 1 => Mixer::Delta(Delta {
-                    w_qkv: r.i32s(mul(m.conv_dim(), d)?)?,
-                    w_z: r.i32s(mul(m.lin_v(), d)?)?,
-                    w_b: r.i32s(mul(m.lin_heads, d)?)?,
-                    w_a: r.i32s(mul(m.lin_heads, d)?)?,
+                    w_qkv: r.tensor(mul(m.conv_dim(), d)?)?,
+                    w_z: r.tensor(mul(m.lin_v(), d)?)?,
+                    w_b: r.tensor(mul(m.lin_heads, d)?)?,
+                    w_a: r.tensor(mul(m.lin_heads, d)?)?,
                     conv: r.i32s(mul(m.conv_dim(), m.conv_kernel)?)?,
                     a_exp: r.i32s(m.lin_heads)?,
                     dt_bias: r.i32s(m.lin_heads)?,
                     gnorm: r.i32s(m.lin_v_dim)?,
-                    w_out: r.i32s(mul(d, m.lin_v())?)?,
+                    w_out: r.tensor(mul(d, m.lin_v())?)?,
                 }),
                 other => return err(format!("unknown layer type {other}")),
             };
@@ -469,9 +570,9 @@ impl Model {
                 norm1,
                 mixer,
                 norm2: r.i32s(d)?,
-                w_gate: r.i32s(mul(h, d)?)?,
-                w_up: r.i32s(mul(h, d)?)?,
-                w_down: r.i32s(mul(d, h)?)?,
+                w_gate: r.tensor(mul(h, d)?)?,
+                w_up: r.tensor(mul(h, d)?)?,
+                w_down: r.tensor(mul(d, h)?)?,
             });
         }
         m.final_norm = r.i32s(d)?;
@@ -479,7 +580,7 @@ impl Model {
         m.rope_cos = r.i32s(rope)?;
         m.rope_sin = r.i32s(rope)?;
         if !shared {
-            m.wcls = Some(r.i32s(mul(v, d)?)?);
+            m.wcls = Some(r.tensor(mul(v, d)?)?);
         }
 
         let token = |r: &mut Reader<_>| -> Result<(u32, Vec<u8>)> {
@@ -582,33 +683,37 @@ impl Model {
         for l in &self.layers {
             put_u32(&mut out, matches!(l.mixer, Mixer::Delta(_)) as u32);
         }
-        put_i32s(&mut out, &self.tok_emb);
+        put_tensor(&mut out, &self.tok_emb);
         for l in &self.layers {
             put_i32s(&mut out, &l.norm1);
             match &l.mixer {
                 Mixer::Attention(a) => {
-                    for t in [&a.wq, &a.wk, &a.wv, &a.wo, &a.q_norm, &a.k_norm] {
-                        put_i32s(&mut out, t);
+                    for t in [&a.wq, &a.wk, &a.wv, &a.wo] {
+                        put_tensor(&mut out, t);
                     }
+                    put_i32s(&mut out, &a.q_norm);
+                    put_i32s(&mut out, &a.k_norm);
                 }
                 Mixer::Delta(g) => {
-                    for t in [
-                        &g.w_qkv, &g.w_z, &g.w_b, &g.w_a, &g.conv, &g.a_exp, &g.dt_bias, &g.gnorm,
-                        &g.w_out,
-                    ] {
+                    for t in [&g.w_qkv, &g.w_z, &g.w_b, &g.w_a] {
+                        put_tensor(&mut out, t);
+                    }
+                    for t in [&g.conv, &g.a_exp, &g.dt_bias, &g.gnorm] {
                         put_i32s(&mut out, t);
                     }
+                    put_tensor(&mut out, &g.w_out);
                 }
             }
-            for t in [&l.norm2, &l.w_gate, &l.w_up, &l.w_down] {
-                put_i32s(&mut out, t);
+            put_i32s(&mut out, &l.norm2);
+            for t in [&l.w_gate, &l.w_up, &l.w_down] {
+                put_tensor(&mut out, t);
             }
         }
         put_i32s(&mut out, &self.final_norm);
         put_i32s(&mut out, &self.rope_cos);
         put_i32s(&mut out, &self.rope_sin);
         if let Some(w) = &self.wcls {
-            put_i32s(&mut out, w);
+            put_tensor(&mut out, w);
         }
         match &self.vocab {
             Vocab::Scored { byte_base, ranks } => {

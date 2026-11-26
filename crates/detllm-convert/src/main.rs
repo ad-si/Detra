@@ -9,7 +9,7 @@
 //! side is not reproducible across machines.
 
 use detllm::generate::{generate, GenParams};
-use detllm::model::{Attention, Layer, Mixer, Model, Vocab};
+use detllm::model::{Attention, Layer, Mixer, Model, Tensor, Vocab};
 use std::sync::Arc;
 use detllm::sample::{argmax, SampleParams};
 use detllm::sha256::{hex, sha256};
@@ -215,22 +215,24 @@ fn convert(ckpt_path: &str, tokenizer_path: &str, out_path: &str) -> Result<(), 
     let (tokens, ranks) = read_tokenizer(tokenizer_path, c.vocab_size)?;
     let (d, h) = (c.dim, c.hidden_dim);
     let q24 = |name: &str, v: &[f32]| to_fixed(name, v, 24);
+    // Matrices are stored packed when that is lossless (rare for float32 checkpoints).
+    let matrix = |name: &str, v: &[f32]| to_fixed(name, v, 24).map(Tensor::pack);
     let mut layers = Vec::new();
     for l in 0..c.n_layers {
         layers.push(Layer {
             norm1: q24("rms_att", &c.rms_att[l * d..(l + 1) * d])?,
             mixer: Mixer::Attention(Attention {
-                wq: q24("wq", &c.wq[l * d * d..(l + 1) * d * d])?,
-                wk: q24("wk", &c.wk[l * d * d..(l + 1) * d * d])?,
-                wv: q24("wv", &c.wv[l * d * d..(l + 1) * d * d])?,
-                wo: q24("wo", &c.wo[l * d * d..(l + 1) * d * d])?,
+                wq: matrix("wq", &c.wq[l * d * d..(l + 1) * d * d])?,
+                wk: matrix("wk", &c.wk[l * d * d..(l + 1) * d * d])?,
+                wv: matrix("wv", &c.wv[l * d * d..(l + 1) * d * d])?,
+                wo: matrix("wo", &c.wo[l * d * d..(l + 1) * d * d])?,
                 q_norm: Vec::new(),
                 k_norm: Vec::new(),
             }),
             norm2: q24("rms_ffn", &c.rms_ffn[l * d..(l + 1) * d])?,
-            w_gate: q24("w1", &c.w1[l * h * d..(l + 1) * h * d])?,
-            w_down: q24("w2", &c.w2[l * d * h..(l + 1) * d * h])?,
-            w_up: q24("w3", &c.w3[l * h * d..(l + 1) * h * d])?,
+            w_gate: matrix("w1", &c.w1[l * h * d..(l + 1) * h * d])?,
+            w_down: matrix("w2", &c.w2[l * d * h..(l + 1) * d * h])?,
+            w_up: matrix("w3", &c.w3[l * h * d..(l + 1) * h * d])?,
         });
     }
     let model = Model {
@@ -252,12 +254,12 @@ fn convert(ckpt_path: &str, tokenizer_path: &str, out_path: &str) -> Result<(), 
         conv_kernel: 0,
         echo_prompt: true,
         trim_prompt: false,
-        tok_emb: q24("tok_emb", &c.tok_emb)?,
+        tok_emb: matrix("tok_emb", &c.tok_emb)?,
         layers,
         final_norm: q24("rms_final", &c.rms_final)?,
         rope_cos: to_fixed("rope_cos", &c.rope_cos, 30)?,
         rope_sin: to_fixed("rope_sin", &c.rope_sin, 30)?,
-        wcls: c.wcls.as_deref().map(|w| q24("wcls", w)).transpose()?,
+        wcls: c.wcls.as_deref().map(|w| matrix("wcls", w)).transpose()?,
         tokens,
         vocab: Vocab::Scored { byte_base: BYTE_BASE, ranks },
         prefix: vec![BOS_ID],

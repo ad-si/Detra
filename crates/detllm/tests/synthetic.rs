@@ -3,7 +3,7 @@
 //! reproduce them.
 
 use detllm::generate::{run_digest, GenParams};
-use detllm::model::{Attention, Delta, Layer, Mixer, Model, Vocab};
+use detllm::model::{Attention, Delta, Layer, Mixer, Model, Tensor, Vocab};
 use detllm::sample::{Rng, SampleParams};
 use detllm::sha256::{hex, sha256};
 use detllm::tokenizer::Tokenizer;
@@ -45,17 +45,17 @@ fn llama_like() -> Model {
         .map(|_| Layer {
             norm1: vec![1 << 24; dim],
             mixer: Mixer::Attention(Attention {
-                wq: w.q24(dim * dim),
-                wk: w.q24(dim * dim),
-                wv: w.q24(dim * dim),
-                wo: w.q24(dim * dim),
+                wq: w.q24(dim * dim).into(),
+                wk: w.q24(dim * dim).into(),
+                wv: w.q24(dim * dim).into(),
+                wo: w.q24(dim * dim).into(),
                 q_norm: Vec::new(),
                 k_norm: Vec::new(),
             }),
             norm2: vec![1 << 24; dim],
-            w_gate: w.q24(hidden_dim * dim),
-            w_up: w.q24(hidden_dim * dim),
-            w_down: w.q24(dim * hidden_dim),
+            w_gate: w.q24(hidden_dim * dim).into(),
+            w_up: w.q24(hidden_dim * dim).into(),
+            w_down: w.q24(dim * hidden_dim).into(),
         })
         .collect();
     Model {
@@ -77,12 +77,12 @@ fn llama_like() -> Model {
         conv_kernel: 0,
         echo_prompt: true,
         trim_prompt: false,
-        tok_emb: w.q24(vocab_size * dim),
+        tok_emb: w.q24(vocab_size * dim).into(),
         layers,
         final_norm: vec![1 << 24; dim],
         rope_cos: w.q30(seq_len * head_dim / 2),
         rope_sin: w.q30(seq_len * head_dim / 2),
-        wcls: Some(w.q24(vocab_size * dim)),
+        wcls: Some(w.q24(vocab_size * dim).into()),
         tokens,
         vocab: Vocab::Scored { byte_base: 3, ranks: (0..vocab_size as u32).map(|i| i * 7 % 13).collect() },
         prefix: vec![1],
@@ -135,29 +135,31 @@ fn qwen_like() -> Model {
         [0x301, 0x301, 2],
     ];
 
-    let mlp = |w: &mut Weights| (w.q24(hidden_dim * dim), w.q24(hidden_dim * dim), w.q24(dim * hidden_dim));
+    let mlp = |w: &mut Weights| -> (Tensor, Tensor, Tensor) {
+        (w.q24(hidden_dim * dim).into(), w.q24(hidden_dim * dim).into(), w.q24(dim * hidden_dim).into())
+    };
     let mut layers = Vec::new();
     for kind in [1, 0, 1] {
         let mixer = if kind == 0 {
             Mixer::Attention(Attention {
-                wq: w.q24(n_heads * head_dim * 2 * dim),
-                wk: w.q24(n_kv_heads * head_dim * dim),
-                wv: w.q24(n_kv_heads * head_dim * dim),
-                wo: w.q24(dim * n_heads * head_dim),
+                wq: w.q24(n_heads * head_dim * 2 * dim).into(),
+                wk: w.q24(n_kv_heads * head_dim * dim).into(),
+                wv: w.q24(n_kv_heads * head_dim * dim).into(),
+                wo: w.q24(dim * n_heads * head_dim).into(),
                 q_norm: w.positive(head_dim),
                 k_norm: w.positive(head_dim),
             })
         } else {
             Mixer::Delta(Delta {
-                w_qkv: w.q24(conv_dim * dim),
-                w_z: w.q24(value_dim * dim),
-                w_b: w.q24(lin_heads * dim),
-                w_a: w.q24(lin_heads * dim),
+                w_qkv: w.q24(conv_dim * dim).into(),
+                w_z: w.q24(value_dim * dim).into(),
+                w_b: w.q24(lin_heads * dim).into(),
+                w_a: w.q24(lin_heads * dim).into(),
                 conv: w.q24(conv_dim * conv_kernel),
                 a_exp: w.positive(lin_heads),
                 dt_bias: w.q24(lin_heads),
                 gnorm: w.positive(lin_v_dim),
-                w_out: w.q24(dim * value_dim),
+                w_out: w.q24(dim * value_dim).into(),
             })
         };
         let (w_gate, w_up, w_down) = mlp(&mut w);
@@ -182,7 +184,7 @@ fn qwen_like() -> Model {
         conv_kernel,
         echo_prompt: false,
         trim_prompt: true,
-        tok_emb: w.q24(vocab_size * dim),
+        tok_emb: w.q24(vocab_size * dim).into(),
         layers,
         final_norm: w.positive(dim),
         rope_cos: w.q30(seq_len * rotary_dim / 2),
@@ -199,8 +201,8 @@ fn qwen_like() -> Model {
 #[test]
 fn file_format_roundtrip() {
     for (model, digest) in [
-        (llama_like(), "84cfd42ba382c24f71a6d65431af7263417c85e4069ca51305015b044a838f3c"),
-        (qwen_like(), "6fc14cebc2328f0cca04272736fbed1a79125550497960934a83b2d61d41ea07"),
+        (llama_like(), "8e8d0f0debfaafd7db3aa37c85362a4ac133cac8c5e7ad5a645a686511508b77"),
+        (qwen_like(), "4ce64dc06c92c4ed0c2771f6611aa64112632391696f38b64c45bf23efa379c7"),
     ] {
         let bytes = model.to_bytes().unwrap();
         assert_eq!(Model::from_bytes(&bytes).unwrap(), model);
@@ -303,9 +305,9 @@ fn thread_count_does_not_change_the_result() {
     let dim = model.dim;
     model.hidden_dim = 3000;
     for layer in &mut model.layers {
-        layer.w_gate = w.q24(3000 * dim);
-        layer.w_up = w.q24(3000 * dim);
-        layer.w_down = w.q24(dim * 3000);
+        layer.w_gate = w.q24(3000 * dim).into();
+        layer.w_up = w.q24(3000 * dim).into();
+        layer.w_down = w.q24(dim * 3000).into();
     }
     let one = digests(model.clone(), b"the and then", 1);
     for threads in [2, 3, 8] {
@@ -313,25 +315,91 @@ fn thread_count_does_not_change_the_result() {
     }
 }
 
-/// Every weight tensor of a model except the RoPE tables.
+/// Every weight tensor of a model except the RoPE tables. Matrices must be unpacked.
 fn weight_tensors(model: &mut Model) -> Vec<&mut Vec<i32>> {
-    let mut all = vec![&mut model.tok_emb, &mut model.final_norm];
+    fn wide(t: &mut Tensor) -> &mut Vec<i32> {
+        match t {
+            Tensor::Wide(v) => v,
+            Tensor::Packed(_) => panic!("expected an unpacked tensor"),
+        }
+    }
+    let mut all = vec![wide(&mut model.tok_emb), &mut model.final_norm];
     if let Some(w) = &mut model.wcls {
-        all.push(w);
+        all.push(wide(w));
     }
     for layer in &mut model.layers {
-        all.extend([&mut layer.norm1, &mut layer.norm2, &mut layer.w_gate, &mut layer.w_up, &mut layer.w_down]);
+        all.extend([&mut layer.norm1, &mut layer.norm2]);
+        all.extend([wide(&mut layer.w_gate), wide(&mut layer.w_up), wide(&mut layer.w_down)]);
         match &mut layer.mixer {
             Mixer::Attention(a) => {
-                all.extend([&mut a.wq, &mut a.wk, &mut a.wv, &mut a.wo, &mut a.q_norm, &mut a.k_norm])
+                all.extend([wide(&mut a.wq), wide(&mut a.wk), wide(&mut a.wv), wide(&mut a.wo)]);
+                all.extend([&mut a.q_norm, &mut a.k_norm]);
             }
-            Mixer::Delta(g) => all.extend([
-                &mut g.w_qkv, &mut g.w_z, &mut g.w_b, &mut g.w_a, &mut g.conv, &mut g.a_exp, &mut g.dt_bias,
-                &mut g.gnorm, &mut g.w_out,
-            ]),
+            Mixer::Delta(g) => {
+                all.extend([wide(&mut g.w_qkv), wide(&mut g.w_z), wide(&mut g.w_b), wide(&mut g.w_a)]);
+                all.extend([&mut g.conv, &mut g.a_exp, &mut g.dt_bias, &mut g.gnorm]);
+                all.push(wide(&mut g.w_out));
+            }
         }
     }
     all
+}
+
+/// Every matrix of a model.
+fn matrices(model: &mut Model) -> Vec<&mut Tensor> {
+    let mut all = vec![&mut model.tok_emb];
+    all.extend(model.wcls.as_mut());
+    for layer in &mut model.layers {
+        all.extend([&mut layer.w_gate, &mut layer.w_up, &mut layer.w_down]);
+        match &mut layer.mixer {
+            Mixer::Attention(a) => all.extend([&mut a.wq, &mut a.wk, &mut a.wv, &mut a.wo]),
+            Mixer::Delta(g) => all.extend([&mut g.w_qkv, &mut g.w_z, &mut g.w_b, &mut g.w_a, &mut g.w_out]),
+        }
+    }
+    all
+}
+
+/// Round every matrix value to 8 significant bits, as weights converted from 16-bit
+/// floats are, so that the matrices can be packed.
+fn with_packable_weights(mut model: Model) -> Model {
+    for tensor in matrices(&mut model) {
+        let Tensor::Wide(values) = tensor else { panic!("expected an unpacked tensor") };
+        for v in values.iter_mut() {
+            let drop = (32 - v.unsigned_abs().leading_zeros()).saturating_sub(8);
+            *v = (*v >> drop) << drop;
+        }
+    }
+    model
+}
+
+/// The same model with every matrix stored packed.
+fn packed(mut model: Model) -> Model {
+    for tensor in matrices(&mut model) {
+        let Tensor::Wide(values) = std::mem::replace(tensor, Tensor::Wide(Vec::new())) else {
+            panic!("expected an unpacked tensor")
+        };
+        *tensor = Tensor::pack(values);
+        assert!(matches!(tensor, Tensor::Packed(_)), "weights should be packable");
+    }
+    model
+}
+
+/// Packing is only an encoding: the packed model gives the same results, through the
+/// single-position kernel (generation) and the multi-position one (prompt blocks).
+#[test]
+fn packed_and_unpacked_models_agree() {
+    for model in [with_packable_weights(llama_like()), with_packable_weights(qwen_like())] {
+        let twin = packed(model.clone());
+        assert_ne!(twin.to_bytes().unwrap(), model.to_bytes().unwrap());
+        assert_eq!(Model::from_bytes(&twin.to_bytes().unwrap()).unwrap(), twin);
+        assert_eq!(digests(twin.clone(), b"the and 12 then the", 1), digests(model.clone(), b"the and 12 then the", 1));
+        assert_eq!(fuzz_digest(twin, 21, 40), fuzz_digest(model, 21, 40));
+    }
+    // Values that cannot be packed stay as they are, and every packed value decodes.
+    assert_eq!(Tensor::pack(vec![1025]), Tensor::Wide(vec![1025]));
+    let values = vec![0, 1, -1, 1023, -1024, 1023 << 21, -1024 << 21, i32::MIN, 3 << 30];
+    let Tensor::Packed(p) = Tensor::pack(values.clone()) else { panic!("values should be packable") };
+    assert_eq!(p.iter().map(|&p| Tensor::unpack(p)).collect::<Vec<_>>(), values);
 }
 
 /// Replace all weights by values chosen to provoke overflow: the extremes of `i32`,
@@ -484,5 +552,5 @@ fn corrupted_model_files_have_fixed_outcomes() {
         }
     }
     assert!(loaded > 100 && rejected > 100, "loaded {loaded}, rejected {rejected}");
-    assert_eq!(hex(&all.finalize()), "e7cc1f5f10694044827ab8a606348b48c50c05bebe134dec7269280d0dfd42ab");
+    assert_eq!(hex(&all.finalize()), "ebd6adda13fa98fc9109faf561460ca00e586d511f744b21efd5c01f81494a98");
 }

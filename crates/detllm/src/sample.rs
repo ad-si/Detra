@@ -72,12 +72,14 @@ pub fn sample(logits: &[i32], p: &SampleParams, rng: &mut Rng) -> u32 {
         return argmax(logits);
     }
     let mut order: Vec<u32> = (0..logits.len() as u32).collect();
-    order.sort_unstable_by(|&a, &b| {
-        logits[b as usize].cmp(&logits[a as usize]).then(a.cmp(&b))
-    });
+    // The order is total, so selecting the first `top_k` before sorting them gives
+    // exactly the prefix a full sort would.
+    let by_rank = |a: &u32, b: &u32| logits[*b as usize].cmp(&logits[*a as usize]).then(a.cmp(b));
     if p.top_k > 0 && p.top_k < order.len() {
+        order.select_nth_unstable_by(p.top_k - 1, by_rank);
         order.truncate(p.top_k);
     }
+    order.sort_unstable_by(by_rank);
     let max = logits[order[0] as usize] as i64;
     let mut weights: Vec<u64> = order
         .iter()

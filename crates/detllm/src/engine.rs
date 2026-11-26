@@ -10,6 +10,10 @@
 //! weights Q24, unit vectors / gates / probabilities Q30, recurrent state `i64` Q32.
 //! A matrix product accumulates Q44 in a wrapping `i64`; results that become
 //! activations are clamped to the `i32` range.
+//!
+//! Several consecutive positions can be processed in one call. This is purely a matter
+//! of speed: each position's result is defined by the single-position computation, and
+//! processing a sequence in blocks of any size gives the same bits.
 
 use crate::fixed::{
     clamp_i64, exp_neg_q30, isqrt_u128, rshift_round, rshift_round_wide, saturate, saturate_wide,
@@ -18,7 +22,7 @@ use crate::fixed::{
 use crate::model::{Attention, Delta, Mixer, Model};
 use crate::pool::{Pool, Weight};
 use crate::{err, Result};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Shift that turns a Q44 product sum into a Q20 activation.
 const TO_ACT: u32 = 24;
@@ -26,6 +30,8 @@ const TO_ACT: u32 = 24;
 const TO_RESIDUAL: u32 = 12;
 /// Shift that turns a Q44 product sum into a Q30 gate input.
 const TO_GATE: u32 = 14;
+/// Epsilon of the L2 normalisation in gated delta layers: round(1e-6 * 2^40).
+const L2_EPS_Q40: u128 = 1_099_512;
 
 /// Root mean square in Q30 of `n` values with `frac` fractional bits, where `sum_sq` is
 /// the sum of their squares and `eps_q32` the model's epsilon:
@@ -49,6 +55,15 @@ fn rmsnorm_residual(out: &mut [i32], x: &[i64], w: &[i32], eps_q32: u32) {
     for ((o, &xv), &wv) in out.iter_mut().zip(x).zip(w) {
         *o = saturate_wide((xv as i128 * wv as i128) / rms);
     }
+}
+
+/// RMSNorm of every position of the residual stream.
+fn rmsnorm_all(x: &[i64], w: &[i32], eps_q32: u32) -> Vec<i32> {
+    let mut out = vec![0i32; x.len()];
+    for (o, xv) in out.chunks_exact_mut(w.len()).zip(x.chunks_exact(w.len())) {
+        rmsnorm_residual(o, xv, w, eps_q32);
+    }
+    out
 }
 
 /// `saturate(trunc(x * w * 2^6 / rms))`: a Q20 value times a Q24 weight over a Q30
@@ -78,16 +93,148 @@ fn rope(v: &mut [i32], cos: &[i32], sin: &[i32], halves: bool) {
     }
 }
 
-fn activations(values: Vec<i64>) -> Vec<i32> {
-    values.into_iter().map(saturate).collect()
+fn activations(values: Vec<i64>) -> Arc<Vec<i32>> {
+    Arc::new(values.into_iter().map(saturate).collect())
+}
+
+fn add_to(x: &mut [i64], update: &[i64]) {
+    for (x, &r) in x.iter_mut().zip(update) {
+        *x = x.wrapping_add(r);
+    }
 }
 
 enum LayerState {
     /// Rotated keys and values of every past position, `kv_rows` each.
-    Attention { keys: Vec<i32>, vals: Vec<i32> },
+    Attention { keys: Arc<Vec<i32>>, vals: Arc<Vec<i32>> },
     /// `conv`: the last `conv_kernel - 1` inputs of the convolution, oldest first.
     /// `memory`: per head a `[lin_k_dim, lin_v_dim]` matrix in Q32.
-    Delta { conv: Vec<i32>, memory: Vec<i64> },
+    Delta { conv: Vec<i32>, memory: Vec<Arc<Vec<i64>>> },
+}
+
+/// One head of a gated delta layer over `count` consecutive positions.
+///
+/// `qkv` holds, per position, the convolved queries, keys and values of all heads;
+/// `z`, `a` and `b` the gate projections. `mem` is the head's memory, updated in place.
+/// Appends `lin_v_dim` outputs per position to `out`.
+#[allow(clippy::too_many_arguments)]
+fn delta_head(
+    m: &Model,
+    g: &Delta,
+    h: usize,
+    count: usize,
+    qkv: &[i32],
+    z: &[i32],
+    a: &[i64],
+    b: &[i64],
+    mem: &mut [i64],
+    out: &mut Vec<i64>,
+) {
+    let (heads, kd, vd) = (m.lin_heads, m.lin_k_dim, m.lin_v_dim);
+    let (key_dim, conv_dim, value_dim) = (m.lin_k(), m.conv_dim(), m.lin_v());
+    let mut key = vec![0i64; kd];
+    let mut query = vec![0i64; kd];
+    let mut kv_mem = vec![0i128; vd];
+    let mut delta = vec![0i64; vd];
+    let mut read = vec![0i128; vd];
+    for t in 0..count {
+        let at = &qkv[t * conv_dim..(t + 1) * conv_dim];
+        let q_raw = &at[h * kd..(h + 1) * kd];
+        let k_raw = &at[key_dim + h * kd..key_dim + (h + 1) * kd];
+        let value = &at[2 * key_dim + h * vd..2 * key_dim + (h + 1) * vd];
+        let z = &z[t * value_dim + h * vd..t * value_dim + (h + 1) * vd];
+
+        // Unit key, and unit query divided by sqrt(lin_k_dim), both in Q30.
+        let norm = |v: &[i32], scale: usize| -> i128 {
+            let ss = sum_sq(v.iter().map(|&x| x as i64)).wrapping_add(L2_EPS_Q40);
+            (isqrt_u128(ss.wrapping_mul(scale as u128) << 20) as i128).max(1)
+        };
+        let (k_den, q_den) = (norm(k_raw, 1), norm(q_raw, kd));
+        for i in 0..kd {
+            key[i] = clamp_i64(((k_raw[i] as i128) << 40) / k_den);
+            query[i] = clamp_i64(((q_raw[i] as i128) << 40) / q_den);
+        }
+
+        // decay = exp(-a_exp * softplus(a + dt_bias)), beta = sigmoid(b), both Q30.
+        let rate = softplus_q30(a[t * heads + h].saturating_add((g.dt_bias[h] as i64) << 6));
+        let decay = exp_neg_q30(rshift_round_wide(rate as i128 * g.a_exp[h] as i128, 24)) as i128;
+        let beta = sigmoid_q30_wide(b[t * heads + h]) as i128;
+
+        // Decay the memory and read what it currently stores under this key.
+        kv_mem.fill(0);
+        for (row, &kk) in mem.chunks_exact_mut(vd).zip(&key) {
+            for (s, acc) in row.iter_mut().zip(kv_mem.iter_mut()) {
+                *s = rshift_round_wide(*s as i128 * decay, 30);
+                *acc = acc.wrapping_add(*s as i128 * kk as i128);
+            }
+        }
+        // Move the stored value toward the new one, then read with the query.
+        for ((dv, &acc), &v) in delta.iter_mut().zip(&kv_mem).zip(value) {
+            let error = ((v as i64) << 12).wrapping_sub(rshift_round_wide(acc, 30));
+            *dv = rshift_round_wide(error as i128 * beta, 30);
+        }
+        read.fill(0);
+        for ((row, &kk), &qq) in mem.chunks_exact_mut(vd).zip(&key).zip(&query) {
+            for ((s, &dv), acc) in row.iter_mut().zip(&delta).zip(read.iter_mut()) {
+                *s = s.wrapping_add(rshift_round_wide(kk as i128 * dv as i128, 30));
+                *acc = acc.wrapping_add(*s as i128 * qq as i128);
+            }
+        }
+
+        // RMSNorm over the head (read out in Q32), scaled by SiLU of the z projection.
+        let core: Vec<i64> = read.iter().map(|&acc| rshift_round_wide(acc, 30)).collect();
+        let rms = rms_q30(sum_sq(core.iter().copied()), vd, 32, m.rms_eps_q32) << 6;
+        for i in 0..vd {
+            let n = saturate_wide((core[i] as i128 * g.gnorm[i] as i128) / rms) as i64;
+            out.push(saturate(rshift_round(n * silu(z[i]) as i64, 20)) as i64);
+        }
+    }
+}
+
+/// Hidden activation of the MLP from its gate and up projections (Q20):
+/// `saturate(round_shift(silu(saturate(gate)) * saturate(up), 20))`.
+fn mlp_hidden(gate: i64, up: i64) -> i64 {
+    saturate(rshift_round(silu(saturate(gate)) as i64 * saturate(up) as i64, 20)) as i64
+}
+
+/// One query head at one position attending to all cached positions up to its own.
+/// `head` holds the head's query values followed by its gate values (if any). Appends
+/// `head_dim` outputs (Q20).
+#[allow(clippy::too_many_arguments)]
+fn attention_head(
+    m: &Model,
+    head: &[i32],
+    keys: &[i32],
+    vals: &[i32],
+    kv: usize,
+    visible: usize,
+    sqrt_head_q16: i64,
+    out: &mut Vec<i64>,
+) {
+    let (hd, kv_rows) = (m.head_dim, m.kv_rows());
+    // Score in Q24: the Q40 dot product over sqrt(head_dim) in Q16.
+    let mut att: Vec<i64> = (0..visible)
+        .map(|s| {
+            let ks = &keys[s * kv_rows + kv..][..hd];
+            let mut dot = 0i64;
+            for (&qv, &kv) in head[..hd].iter().zip(ks) {
+                dot = dot.wrapping_add(qv as i64 * kv as i64);
+            }
+            dot / sqrt_head_q16
+        })
+        .collect();
+    softmax_q30(&mut att);
+    for i in 0..hd {
+        // |sum| <= max|v| * sum(att) <= 2^31 * 2^30: cannot overflow.
+        let mut acc = 0i64;
+        for (s, &w) in att.iter().enumerate() {
+            acc += w * vals[s * kv_rows + kv + i] as i64;
+        }
+        let mut value = rshift_round(acc, 30);
+        if m.out_gate {
+            value = rshift_round(value * sigmoid_q30(head[hd + i]), 30);
+        }
+        out.push(saturate(value) as i64);
+    }
 }
 
 pub struct Session {
@@ -97,9 +244,7 @@ pub struct Session {
     /// `isqrt(head_dim * 2^32)`: sqrt(head_dim) in Q16.
     sqrt_head_q16: i64,
     states: Vec<LayerState>,
-    x: Vec<i64>,
-    xn: Vec<i32>,
-    att: Vec<i64>,
+    hidden: Vec<i32>,
     logits: Vec<i32>,
 }
 
@@ -110,10 +255,14 @@ impl Session {
             .layers
             .iter()
             .map(|l| match l.mixer {
-                Mixer::Attention(_) => LayerState::Attention { keys: Vec::new(), vals: Vec::new() },
+                Mixer::Attention(_) => {
+                    LayerState::Attention { keys: Arc::new(Vec::new()), vals: Arc::new(Vec::new()) }
+                }
                 Mixer::Delta(_) => LayerState::Delta {
                     conv: vec![0; (model.conv_kernel - 1) * model.conv_dim()],
-                    memory: vec![0; model.lin_heads * model.lin_k_dim * model.lin_v_dim],
+                    memory: (0..model.lin_heads)
+                        .map(|_| Arc::new(vec![0; model.lin_k_dim * model.lin_v_dim]))
+                        .collect(),
                 },
             })
             .collect();
@@ -122,9 +271,7 @@ impl Session {
             pos: 0,
             sqrt_head_q16: isqrt_u128((model.head_dim as u128) << 32) as i64,
             states,
-            x: vec![0; model.dim],
-            xn: vec![0; model.dim],
-            att: Vec::new(),
+            hidden: Vec::new(),
             logits: Vec::new(),
             model,
         }
@@ -134,221 +281,210 @@ impl Session {
         self.pos
     }
 
-    /// Logits (Q20) of the last step; empty if they were not requested.
+    /// Logits (Q20) after the last position fed; empty if they were not requested.
     pub fn logits(&self) -> &[i32] {
         &self.logits
     }
 
-    /// Final normalised hidden state (Q20) of the last step.
+    /// Final normalised hidden states (Q20) of the positions fed by the last call,
+    /// `dim` values per position.
     pub fn hidden(&self) -> &[i32] {
-        &self.xn
+        &self.hidden
     }
 
     /// Feed one token at the next position. Returns the logits (Q20) for the token that
     /// follows it, or an empty slice if `want_logits` is false.
     pub fn step(&mut self, token: u32, want_logits: bool) -> Result<&[i32]> {
+        self.feed(&[token], want_logits)
+    }
+
+    /// Feed several tokens at the next positions. Equivalent to feeding them one by one;
+    /// logits are computed for the last one only.
+    pub fn feed(&mut self, tokens: &[u32], want_logits: bool) -> Result<&[i32]> {
         let m = Arc::clone(&self.model);
-        if token as usize >= m.vocab_size {
+        let count = tokens.len();
+        if tokens.iter().any(|&t| t as usize >= m.vocab_size) {
             return err("token id is outside the vocabulary");
         }
-        if self.pos >= m.seq_len {
+        if count > m.seq_len - self.pos.min(m.seq_len) {
             return err("context window is full");
         }
+        self.logits = Vec::new();
+        self.hidden = Vec::new();
+        if count == 0 {
+            return Ok(&self.logits);
+        }
         let d = m.dim;
-        let emb = &m.tok_emb[token as usize * d..(token as usize + 1) * d];
-        for (x, &e) in self.x.iter_mut().zip(emb) {
-            *x = (e as i64) << 8;
+        let mut x = vec![0i64; count * d];
+        for (xs, &token) in x.chunks_exact_mut(d).zip(tokens) {
+            for (i, x) in xs.iter_mut().enumerate() {
+                *x = (m.tok_emb.get(token as usize * d + i) as i64) << 8;
+            }
         }
 
         for (l, layer) in m.layers.iter().enumerate() {
-            rmsnorm_residual(&mut self.xn, &self.x, &layer.norm1, m.rms_eps_q32);
+            let xn = self.norm(&x, &layer.norm1, count);
             let mixed = match &layer.mixer {
-                Mixer::Attention(a) => self.attention(l, a),
-                Mixer::Delta(g) => self.delta(l, g),
+                Mixer::Attention(a) => self.attention(l, a, &xn, count),
+                Mixer::Delta(_) => self.delta(l, &xn, count),
             };
-            for (x, r) in self.x.iter_mut().zip(mixed) {
-                *x = x.wrapping_add(r);
-            }
+            add_to(&mut x, &mixed);
 
-            rmsnorm_residual(&mut self.xn, &self.x, &layer.norm2, m.rms_eps_q32);
-            let gate = self.pool.matvec(&m, Weight::Gate(l), &self.xn, TO_ACT);
-            let up = self.pool.matvec(&m, Weight::Up(l), &self.xn, TO_ACT);
-            let hidden: Vec<i32> = gate
-                .iter()
-                .zip(&up)
-                .map(|(&g, &u)| saturate(rshift_round(silu(saturate(g)) as i64 * saturate(u) as i64, 20)))
-                .collect();
-            let down = self.pool.matvec(&m, Weight::Down(l), &hidden, TO_RESIDUAL);
-            for (x, r) in self.x.iter_mut().zip(down) {
-                *x = x.wrapping_add(r);
-            }
+            let xn = self.norm(&x, &layer.norm2, count);
+            let hidden =
+                self.pool.matmul_pair(&m, (Weight::Gate(l), Weight::Up(l)), &xn, count, TO_ACT, mlp_hidden);
+            let hidden = Arc::new(hidden.into_iter().map(|v| v as i32).collect());
+            let down = self.pool.matmul(&m, Weight::Down(l), &hidden, count, TO_RESIDUAL);
+            add_to(&mut x, &down);
         }
 
-        rmsnorm_residual(&mut self.xn, &self.x, &m.final_norm, m.rms_eps_q32);
-        self.logits = if want_logits {
-            activations(self.pool.matvec(&m, Weight::Classifier, &self.xn, TO_ACT))
-        } else {
-            Vec::new()
-        };
-        self.pos += 1;
+        self.hidden = self.norm(&x, &m.final_norm, count).to_vec();
+        if want_logits {
+            let last = Arc::new(self.hidden[(count - 1) * d..].to_vec());
+            let logits = self.pool.matmul(&m, Weight::Classifier, &last, 1, TO_ACT);
+            self.logits = logits.into_iter().map(saturate).collect();
+        }
+        self.pos += count;
         Ok(&self.logits)
     }
 
-    /// Causal attention over all positions so far. Returns the update of the residual.
-    fn attention(&mut self, l: usize, a: &Attention) -> Vec<i64> {
+    /// RMSNorm of every position of the residual stream, in parallel when there are
+    /// several positions.
+    fn norm(&self, x: &[i64], w: &[i32], count: usize) -> Arc<Vec<i32>> {
+        if count < 4 {
+            return Arc::new(rmsnorm_all(x, w, self.model.rms_eps_q32));
+        }
+        let (x, w, eps) = (Arc::new(x.to_vec()), Arc::new(w.to_vec()), self.model.rms_eps_q32);
+        let dim = w.len();
+        let values = self.pool.map(count, true, true, move |t, out| {
+            let mut normed = vec![0i32; dim];
+            rmsnorm_residual(&mut normed, &x[t * dim..(t + 1) * dim], &w, eps);
+            out.extend(normed.iter().map(|&v| v as i64));
+        });
+        Arc::new(values.into_iter().map(|v| v as i32).collect())
+    }
+
+    /// Causal attention for `count` new positions. Returns the update of the residual.
+    fn attention(&mut self, l: usize, a: &Attention, xn: &Arc<Vec<i32>>, count: usize) -> Vec<i64> {
         let m = Arc::clone(&self.model);
-        let (hd, pos) = (m.head_dim, self.pos);
+        let hd = m.head_dim;
         let half = m.rotary_dim / 2;
-        let cos = &m.rope_cos[pos * half..(pos + 1) * half];
-        let sin = &m.rope_sin[pos * half..(pos + 1) * half];
         let q_stride = hd * (1 + m.out_gate as usize);
+        let (q_rows, kv_rows, att_out) = (m.q_rows(), m.kv_rows(), m.att_out());
 
         // Per head, wq yields `head_dim` query values followed by the gate values.
-        let mut q = activations(self.pool.matvec(&m, Weight::Wq(l), &self.xn, TO_ACT));
-        let mut k = activations(self.pool.matvec(&m, Weight::Wk(l), &self.xn, TO_ACT));
-        let v = activations(self.pool.matvec(&m, Weight::Wv(l), &self.xn, TO_ACT));
-        for head in q.chunks_exact_mut(q_stride) {
-            if m.qk_norm {
-                rmsnorm_head(&mut head[..hd], &a.q_norm, m.rms_eps_q32);
+        let mut q: Vec<i32> = self.pool.matmul(&m, Weight::Wq(l), xn, count, TO_ACT).into_iter().map(saturate).collect();
+        let mut k: Vec<i32> = self.pool.matmul(&m, Weight::Wk(l), xn, count, TO_ACT).into_iter().map(saturate).collect();
+        let v = activations(self.pool.matmul(&m, Weight::Wv(l), xn, count, TO_ACT));
+        for t in 0..count {
+            let pos = self.pos + t;
+            let cos = &m.rope_cos[pos * half..(pos + 1) * half];
+            let sin = &m.rope_sin[pos * half..(pos + 1) * half];
+            for head in q[t * q_rows..(t + 1) * q_rows].chunks_exact_mut(q_stride) {
+                if m.qk_norm {
+                    rmsnorm_head(&mut head[..hd], &a.q_norm, m.rms_eps_q32);
+                }
+                rope(&mut head[..hd], cos, sin, m.rope_halves);
             }
-            rope(&mut head[..hd], cos, sin, m.rope_halves);
-        }
-        for head in k.chunks_exact_mut(hd) {
-            if m.qk_norm {
-                rmsnorm_head(head, &a.k_norm, m.rms_eps_q32);
+            for head in k[t * kv_rows..(t + 1) * kv_rows].chunks_exact_mut(hd) {
+                if m.qk_norm {
+                    rmsnorm_head(head, &a.k_norm, m.rms_eps_q32);
+                }
+                rope(head, cos, sin, m.rope_halves);
             }
-            rope(head, cos, sin, m.rope_halves);
         }
         let LayerState::Attention { keys, vals } = &mut self.states[l] else {
             unreachable!("layer state does not match the layer type");
         };
-        keys.extend_from_slice(&k);
-        vals.extend_from_slice(&v);
+        // No other reference exists between calls, so this extends the caches in place.
+        Arc::make_mut(keys).extend_from_slice(&k);
+        Arc::make_mut(vals).extend_from_slice(&v);
 
-        let kv_rows = m.kv_rows();
+        // Every (position, head) pair is independent of the others.
         let group = m.n_heads / m.n_kv_heads;
-        let mut out = vec![0i32; m.att_out()];
-        self.att.resize(pos + 1, 0);
-        for h in 0..m.n_heads {
-            let head = &q[h * q_stride..(h + 1) * q_stride];
+        let (n_heads, first_pos, sqrt_head_q16) = (m.n_heads, self.pos, self.sqrt_head_q16);
+        let (q, keys, vals, model) = (Arc::new(q), Arc::clone(keys), Arc::clone(vals), Arc::clone(&m));
+        let parallel = count * n_heads * (first_pos + count) * hd >= 1 << 16;
+        let out = self.pool.map(count * n_heads, parallel, true, move |block, out| {
+            let (t, h) = (block / n_heads, block % n_heads);
+            let head = &q[t * q_rows + h * q_stride..t * q_rows + (h + 1) * q_stride];
             let kv = (h / group) * hd;
-            // Score in Q24: the Q40 dot product over sqrt(head_dim) in Q16.
-            for (t, score) in self.att.iter_mut().enumerate() {
-                let kt = &keys[t * kv_rows + kv..][..hd];
-                let mut dot = 0i64;
-                for (&qv, &kv) in head[..hd].iter().zip(kt) {
-                    dot = dot.wrapping_add(qv as i64 * kv as i64);
-                }
-                *score = dot / self.sqrt_head_q16;
-            }
-            softmax_q30(&mut self.att);
-            for i in 0..hd {
-                // |sum| <= max|v| * sum(att) <= 2^31 * 2^30: cannot overflow.
-                let mut acc = 0i64;
-                for (t, &w) in self.att.iter().enumerate() {
-                    acc += w * vals[t * kv_rows + kv + i] as i64;
-                }
-                let mut value = rshift_round(acc, 30);
-                if m.out_gate {
-                    value = rshift_round(value * sigmoid_q30(head[hd + i]), 30);
-                }
-                out[h * hd + i] = saturate(value);
-            }
-        }
-        self.pool.matvec(&m, Weight::Wo(l), &out, TO_RESIDUAL)
+            attention_head(&model, head, &keys, &vals, kv, first_pos + t + 1, sqrt_head_q16, out);
+        });
+        debug_assert_eq!(out.len(), count * att_out);
+        let out = Arc::new(out.into_iter().map(|v| v as i32).collect());
+        self.pool.matmul(&m, Weight::Wo(l), &out, count, TO_RESIDUAL)
     }
 
-    /// Gated delta layer. Returns the update of the residual.
-    fn delta(&mut self, l: usize, g: &Delta) -> Vec<i64> {
+    /// Gated delta layer for `count` new positions. Returns the update of the residual.
+    fn delta(&mut self, l: usize, xn: &Arc<Vec<i32>>, count: usize) -> Vec<i64> {
         let m = Arc::clone(&self.model);
-        let (heads, kd, vd) = (m.lin_heads, m.lin_k_dim, m.lin_v_dim);
-        let (key_dim, conv_dim, kernel) = (m.lin_k(), m.conv_dim(), m.conv_kernel);
+        let (heads, vd) = (m.lin_heads, m.lin_v_dim);
+        let (conv_dim, kernel, value_dim) = (m.conv_dim(), m.conv_kernel, m.lin_v());
 
-        let mixed = activations(self.pool.matvec(&m, Weight::Qkv(l), &self.xn, TO_ACT));
-        let z = activations(self.pool.matvec(&m, Weight::Z(l), &self.xn, TO_ACT));
-        let b = self.pool.matvec(&m, Weight::B(l), &self.xn, TO_GATE);
-        let a = self.pool.matvec(&m, Weight::A(l), &self.xn, TO_GATE);
+        let mixed = activations(self.pool.matmul(&m, Weight::Qkv(l), xn, count, TO_ACT));
+        let z = activations(self.pool.matmul(&m, Weight::Z(l), xn, count, TO_ACT));
+        let b = Arc::new(self.pool.matmul(&m, Weight::B(l), xn, count, TO_GATE));
+        let a = Arc::new(self.pool.matmul(&m, Weight::A(l), xn, count, TO_GATE));
 
         let LayerState::Delta { conv, memory } = &mut self.states[l] else {
             unreachable!("layer state does not match the layer type");
         };
         // Causal depthwise convolution over the last `kernel` inputs, then SiLU.
-        let mut qkv = vec![0i32; conv_dim];
-        for (c, out) in qkv.iter_mut().enumerate() {
-            let w = &g.conv[c * kernel..(c + 1) * kernel];
-            let mut acc = w[kernel - 1] as i64 * mixed[c] as i64;
-            for j in 0..kernel - 1 {
-                acc = acc.wrapping_add(w[j] as i64 * conv[j * conv_dim + c] as i64);
-            }
-            *out = silu(saturate(rshift_round(acc, TO_ACT)));
-        }
-        if kernel > 1 {
-            conv.copy_within(conv_dim.., 0);
-            conv[(kernel - 2) * conv_dim..].copy_from_slice(&mixed);
-        }
-
-        let mut out = vec![0i32; m.lin_v()];
-        let mut key = vec![0i64; kd];
-        let mut query = vec![0i64; kd];
-        let mut kv_mem = vec![0i128; vd];
-        let mut delta = vec![0i64; vd];
-        let mut read = vec![0i128; vd];
-        for h in 0..heads {
-            let q_raw = &qkv[h * kd..(h + 1) * kd];
-            let k_raw = &qkv[key_dim + h * kd..key_dim + (h + 1) * kd];
-            let value = &qkv[2 * key_dim + h * vd..2 * key_dim + (h + 1) * vd];
-            let mem = &mut memory[h * kd * vd..(h + 1) * kd * vd];
-
-            // Unit key, and unit query divided by sqrt(lin_k_dim), both in Q30. The
-            // epsilon of this normalisation is 1e-6, the same as the model's RMS epsilon
-            // only by coincidence of the reference implementation; it is a constant here.
-            let norm = |v: &[i32], scale: usize| -> i128 {
-                let ss = sum_sq(v.iter().map(|&x| x as i64)).wrapping_add(L2_EPS_Q40);
-                (isqrt_u128(ss.wrapping_mul(scale as u128) << 20) as i128).max(1)
+        // `history` is the remembered inputs followed by the new ones. Channels are
+        // independent of each other, so blocks of channels run in parallel.
+        let mut history = std::mem::take(conv);
+        history.extend_from_slice(&mixed);
+        *conv = history[count * conv_dim..].to_vec();
+        const CHANNELS: usize = 128;
+        let (history, model) = (Arc::new(history), Arc::clone(&m));
+        let by_channel = self.pool.map(conv_dim.div_ceil(CHANNELS), true, true, move |block, out| {
+            let Mixer::Delta(g) = &model.layers[l].mixer else {
+                unreachable!("layer {l} is not a gated delta layer");
             };
-            let (k_den, q_den) = (norm(k_raw, 1), norm(q_raw, kd));
-            for i in 0..kd {
-                key[i] = clamp_i64(((k_raw[i] as i128) << 40) / k_den);
-                query[i] = clamp_i64(((q_raw[i] as i128) << 40) / q_den);
-            }
-
-            // decay = exp(-a_exp * softplus(a + dt_bias)), beta = sigmoid(b), both Q30.
-            let rate = softplus_q30(a[h].saturating_add((g.dt_bias[h] as i64) << 6));
-            let decay = exp_neg_q30(rshift_round_wide(rate as i128 * g.a_exp[h] as i128, 24)) as i128;
-            let beta = sigmoid_q30_wide(b[h]) as i128;
-
-            // Decay the memory and read what it currently stores under this key.
-            kv_mem.fill(0);
-            for (row, &kk) in mem.chunks_exact_mut(vd).zip(&key) {
-                for (s, acc) in row.iter_mut().zip(kv_mem.iter_mut()) {
-                    *s = rshift_round_wide(*s as i128 * decay, 30);
-                    *acc = acc.wrapping_add(*s as i128 * kk as i128);
+            for c in block * CHANNELS..((block + 1) * CHANNELS).min(conv_dim) {
+                let w = &g.conv[c * kernel..(c + 1) * kernel];
+                for t in 0..count {
+                    let mut acc = 0i64;
+                    for (j, &wj) in w.iter().enumerate() {
+                        acc = acc.wrapping_add(wj as i64 * history[(t + j) * conv_dim + c] as i64);
+                    }
+                    out.push(silu(saturate(rshift_round(acc, TO_ACT))) as i64);
                 }
             }
-            // Move the stored value toward the new one, then read with the query.
-            for ((dv, &acc), &v) in delta.iter_mut().zip(&kv_mem).zip(value) {
-                let error = ((v as i64) << 12).wrapping_sub(rshift_round_wide(acc, 30));
-                *dv = rshift_round_wide(error as i128 * beta, 30);
-            }
-            read.fill(0);
-            for ((row, &kk), &qq) in mem.chunks_exact_mut(vd).zip(&key).zip(&query) {
-                for ((s, &dv), acc) in row.iter_mut().zip(&delta).zip(read.iter_mut()) {
-                    *s = s.wrapping_add(rshift_round_wide(kk as i128 * dv as i128, 30));
-                    *acc = acc.wrapping_add(*s as i128 * qq as i128);
-                }
-            }
-
-            // RMSNorm over the head (read out in Q32), scaled by SiLU of the z projection.
-            let core: Vec<i64> = read.iter().map(|&acc| rshift_round_wide(acc, 30)).collect();
-            let rms = rms_q30(sum_sq(core.iter().copied()), vd, 32, m.rms_eps_q32) << 6;
-            for i in 0..vd {
-                let n = saturate_wide((core[i] as i128 * g.gnorm[i] as i128) / rms) as i64;
-                out[h * vd + i] = saturate(rshift_round(n * silu(z[h * vd + i]) as i64, 20));
+        });
+        let mut qkv = vec![0i32; count * conv_dim];
+        for (c, values) in by_channel.chunks_exact(count).enumerate() {
+            for (t, &v) in values.iter().enumerate() {
+                qkv[t * conv_dim + c] = v as i32;
             }
         }
-        self.pool.matvec(&m, Weight::Out(l), &out, TO_RESIDUAL)
+
+        // The heads are independent of each other, so they run in parallel. A head
+        // reads the old memory and builds the new one in a buffer of its own, which
+        // makes it a pure function; the first finished copy of each head is kept.
+        let updated: Arc<Vec<Mutex<Option<Vec<i64>>>>> = Arc::new((0..heads).map(|_| Mutex::new(None)).collect());
+        let (qkv, old, new, model) = (Arc::new(qkv), memory.clone(), Arc::clone(&updated), Arc::clone(&m));
+        let by_head = self.pool.map(heads, true, true, move |h, out| {
+            let Mixer::Delta(g) = &model.layers[l].mixer else {
+                unreachable!("layer {l} is not a gated delta layer");
+            };
+            let mut mem = old[h].to_vec();
+            delta_head(&model, g, h, count, &qkv, &z, &a, &b, &mut mem, out);
+            new[h].lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(mem);
+        });
+        for (current, slot) in memory.iter_mut().zip(updated.iter()) {
+            let mem = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            *current = Arc::new(mem.expect("every head stores its memory before it is counted as finished"));
+        }
+        let mut out = vec![0i32; count * value_dim];
+        for (h, values) in by_head.chunks_exact(count * vd).enumerate() {
+            for (t, head) in values.chunks_exact(vd).enumerate() {
+                for (o, &v) in out[t * value_dim + h * vd..].iter_mut().zip(head) {
+                    *o = v as i32;
+                }
+            }
+        }
+        self.pool.matmul(&m, Weight::Out(l), &Arc::new(out), count, TO_RESIDUAL)
     }
 }
-
-/// Epsilon of the L2 normalisation in gated delta layers: round(1e-6 * 2^40).
-const L2_EPS_Q40: u128 = 1_099_512;

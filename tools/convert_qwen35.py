@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["numpy", "tokenizers"]
 # ///
-"""Convert a Hugging Face Qwen3.5 text model to the integer-only DLLM format (version 2).
+"""Convert a Hugging Face Qwen3.5 text model to the integer-only DLLM format (version 3).
 
 Usage: uv run tools/convert_qwen35.py <model-dir> <out.dllm> [--seq-len N]
 
@@ -80,6 +80,39 @@ class Writer:
                 raise SystemExit(f"{name}: value does not fit in Q{frac_bits}")
             self.raw(scaled.astype("<i4").tobytes())
 
+    def matrix(self, name, values, shape):
+        """A Q24 matrix: packed 16-bit if every value fits, plain 32-bit otherwise.
+
+        Packed element p stands for (p >> 5) << (p & 31): an 11-bit signed mantissa
+        times a power of two. Weights converted from bfloat16 always fit.
+        """
+        values = np.asarray(values)
+        if tuple(values.shape) != tuple(shape):
+            raise SystemExit(f"{name}: shape {values.shape}, expected {shape}")
+        flat = values.reshape(-1)
+
+        def chunks():
+            for i in range(0, flat.size, CHUNK):
+                scaled = np.rint(flat[i:i + CHUNK].astype(np.float64) * 2.0**24)
+                if not np.all(np.abs(scaled) < 2.0**31):
+                    raise SystemExit(f"{name}: value does not fit in Q24")
+                yield scaled.astype(np.int64)
+
+        def split(v):
+            lowest = np.where(v == 0, 1, v & -v)
+            shift = np.round(np.log2(lowest)).astype(np.int64)
+            return v >> shift, shift
+
+        packable = all(np.all(np.abs(split(v)[0] + 0.5) < 1024) for v in chunks())
+        self.u32(1 if packable else 0)
+        for v in chunks():
+            if packable:
+                mantissa, shift = split(v)
+                self.raw(((mantissa << 5) | shift).astype("<i2").tobytes())
+            else:
+                self.raw(v.astype("<i4").tobytes())
+        return packable
+
     def ids(self, values):
         self.u32(len(values), *values)
 
@@ -144,39 +177,39 @@ def main():
     st = SafeTensors(src / "model.safetensors")
     w = Writer(out_path)
     w.raw(b"DLLM")
-    w.u32(2, dim, hidden, n_layers, vocab_size, seq_len, round(cfg["rms_norm_eps"] * 2**32),
+    w.u32(3, dim, hidden, n_layers, vocab_size, seq_len, round(cfg["rms_norm_eps"] * 2**32),
           n_heads, n_kv, head_dim, rotary_dim, 1, 1, int(cfg["attn_output_gate"]),
           lin_heads, kd, vd, kernel, 1, 1, 0, 1)
     w.u32(*layer_types)
 
     lm = "model.language_model."
-    w.fixed("embed", st.get(lm + "embed_tokens.weight"), shape=(vocab_size, dim))
+    w.matrix("embed", st.get(lm + "embed_tokens.weight"), (vocab_size, dim))
     for i, kind in enumerate(layer_types):
         p = f"{lm}layers.{i}."
         w.fixed("norm1", 1.0 + st.get(p + "input_layernorm.weight").astype(np.float64), shape=(dim,))
         if kind == 0:
             a = p + "self_attn."
-            w.fixed("wq", st.get(a + "q_proj.weight"), shape=(n_heads * head_dim * 2, dim))
-            w.fixed("wk", st.get(a + "k_proj.weight"), shape=(n_kv * head_dim, dim))
-            w.fixed("wv", st.get(a + "v_proj.weight"), shape=(n_kv * head_dim, dim))
-            w.fixed("wo", st.get(a + "o_proj.weight"), shape=(dim, n_heads * head_dim))
+            w.matrix("wq", st.get(a + "q_proj.weight"), (n_heads * head_dim * 2, dim))
+            w.matrix("wk", st.get(a + "k_proj.weight"), (n_kv * head_dim, dim))
+            w.matrix("wv", st.get(a + "v_proj.weight"), (n_kv * head_dim, dim))
+            w.matrix("wo", st.get(a + "o_proj.weight"), (dim, n_heads * head_dim))
             w.fixed("q_norm", 1.0 + st.get(a + "q_norm.weight").astype(np.float64), shape=(head_dim,))
             w.fixed("k_norm", 1.0 + st.get(a + "k_norm.weight").astype(np.float64), shape=(head_dim,))
         else:
             g = p + "linear_attn."
-            w.fixed("w_qkv", st.get(g + "in_proj_qkv.weight"), shape=(conv_dim, dim))
-            w.fixed("w_z", st.get(g + "in_proj_z.weight"), shape=(value_dim, dim))
-            w.fixed("w_b", st.get(g + "in_proj_b.weight"), shape=(lin_heads, dim))
-            w.fixed("w_a", st.get(g + "in_proj_a.weight"), shape=(lin_heads, dim))
+            w.matrix("w_qkv", st.get(g + "in_proj_qkv.weight"), (conv_dim, dim))
+            w.matrix("w_z", st.get(g + "in_proj_z.weight"), (value_dim, dim))
+            w.matrix("w_b", st.get(g + "in_proj_b.weight"), (lin_heads, dim))
+            w.matrix("w_a", st.get(g + "in_proj_a.weight"), (lin_heads, dim))
             w.fixed("conv", st.get(g + "conv1d.weight").reshape(conv_dim, kernel), shape=(conv_dim, kernel))
             w.fixed("a_exp", np.exp(st.get(g + "A_log").astype(np.float64)), shape=(lin_heads,))
             w.fixed("dt_bias", st.get(g + "dt_bias"), shape=(lin_heads,))
             w.fixed("gnorm", st.get(g + "norm.weight"), shape=(vd,))
-            w.fixed("w_out", st.get(g + "out_proj.weight"), shape=(dim, value_dim))
+            w.matrix("w_out", st.get(g + "out_proj.weight"), (dim, value_dim))
         w.fixed("norm2", 1.0 + st.get(p + "post_attention_layernorm.weight").astype(np.float64), shape=(dim,))
-        w.fixed("w_gate", st.get(p + "mlp.gate_proj.weight"), shape=(hidden, dim))
-        w.fixed("w_up", st.get(p + "mlp.up_proj.weight"), shape=(hidden, dim))
-        w.fixed("w_down", st.get(p + "mlp.down_proj.weight"), shape=(dim, hidden))
+        w.matrix("w_gate", st.get(p + "mlp.gate_proj.weight"), (hidden, dim))
+        w.matrix("w_up", st.get(p + "mlp.up_proj.weight"), (hidden, dim))
+        w.matrix("w_down", st.get(p + "mlp.down_proj.weight"), (dim, hidden))
     w.fixed("final_norm", 1.0 + st.get(lm + "norm.weight").astype(np.float64), shape=(dim,))
 
     inv_freq = float(rope["rope_theta"]) ** (-np.arange(0, rotary_dim, 2, dtype=np.float64) / rotary_dim)

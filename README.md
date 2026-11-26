@@ -13,10 +13,14 @@ on every machine, build profile, and target.
 - No floating point anywhere in the engine crate (enforced by `make lint`).
   Weights are Q24 fixed point, activations and logits Q20,
   the residual stream Q32; probabilities and RoPE sin/cos are Q30.
+- Weights that came from 16-bit floats are stored in a lossless 16-bit encoding,
+  which halves the file size and the memory traffic without changing any result.
 - Every operation that may overflow uses explicit wrapping arithmetic,
   so debug and release builds agree.
 - No dependence on pointer width, endianness, hash-map iteration order,
   or the number of threads (`$DETLLM_THREADS` changes the speed, never the output).
+  Threads only ever compute independent blocks of wrapping integer sums,
+  so neither their number nor their scheduling can affect a result.
 - Sampling (temperature, top-k, top-p) is seeded and also integer-only.
 - The identity of a model is the SHA-256 of its converted `.dllm` file.
   Floating point is only used in the offline converters
@@ -121,6 +125,21 @@ the x86-64, WASM, Miri, and `verify-docker` targets also run it on their archite
 with the Hugging Face float implementation of Qwen3.5.
 `make setup` installs the required Rust targets and components.
 Run `make help` for all targets.
+
+
+## Performance
+
+Qwen3.5-0.8B on an Apple M4 Max (10 performance cores), greedy decoding,
+1030-token prompt, 200 generated tokens (`tools/bench_qwen35.py`):
+
+| Runtime                          | Prompt       | Generation  | Peak memory |
+| -------------------------------- | ------------ | ----------- | ----------- |
+| detllm (integer, CPU)            | ~105 tok/s   | ~65 tok/s   | 1.5 GiB     |
+| detllm (integer, CPU, 1 thread)  | ~18 tok/s    | ~12 tok/s   | 1.5 GiB     |
+| MLX (bfloat16, GPU)              | ~7800 tok/s  | ~185 tok/s  | 1.5 GiB     |
+
+Generation is limited by memory bandwidth (every token reads all weights once),
+prompt processing by integer multiply-accumulate throughput on the CPU.
 
 
 ## Related

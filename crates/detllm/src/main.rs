@@ -140,8 +140,18 @@ fn threads() -> Result<usize, String> {
             Ok(n) => Ok(n.clamp(1, 256) as usize),
             Err(_) => Err(format!("invalid DETLLM_THREADS: {v}")),
         },
-        None => Ok(std::thread::available_parallelism().map_or(1, |n| n.get())),
+        None => Ok(performance_cores().unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))),
     }
+}
+
+/// Number of performance cores on Apple silicon. Generation is limited by memory
+/// bandwidth, and threads on efficiency cores slow it down rather than help.
+fn performance_cores() -> Option<usize> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.perflevel0.physicalcpu"]).output().ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok().filter(|&n| n > 0)
 }
 
 /// Passes bytes through while hashing them.

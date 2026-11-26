@@ -1,0 +1,7 @@
+[package]
+name = "detllm"
+description = "Bit-exact, integer-only LLM inference engine (no floating point, no dependencies)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

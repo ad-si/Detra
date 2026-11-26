@@ -1,0 +1,4 @@
+/target
+/models/*.bin
+/models/*.dllm
+/.claude/settings.local.json

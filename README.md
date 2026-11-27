@@ -267,6 +267,11 @@ prompt processing by integer multiply-accumulate throughput on the CPU.
     (including Mixture-of-Experts) and Segment Anything 2.1
     in exact integer arithmetic for bit-identical output across CPU and GPU.
     Supports distributed inference and an OpenAI-compatible server.
+- [tommasocerruti/detllm] - Python tool for checking whether LLM inference
+    is reproducible on existing backends (Hugging Face transformers, vLLM).
+    Measures run-to-run and batch-size variance, reports tiered guarantees,
+    and writes a minimal repro pack when outputs diverge.
 
 [nathanrs/detllm]: https://github.com/nathanrs/detllm
 [pelloran-inc/tritify]: https://github.com/pelloran-inc/tritify
+[tommasocerruti/detllm]: https://github.com/tommasocerruti/detllm

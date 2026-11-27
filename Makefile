@@ -46,7 +46,7 @@ test: ## Run unit tests and the synthetic-model determinism tests (debug and rel
 .PHONY: lint
 lint: ## Clippy, plus a check that the engine crate contains no floating point
 	cargo clippy --locked --all-targets -- -D warnings
-	uv run --no-project scripts/no-float.py crates/detra
+	cargo run --release --locked --quiet -p detra-dev --bin no-float -- crates/detra
 
 models/stories15M.bin:
 	curl -L --fail -o $@ $(STORIES_URL)
@@ -57,6 +57,9 @@ models/tokenizer.bin:
 $(STORIES): models/stories15M.bin models/tokenizer.bin | build
 	target/release/detra-convert convert models/stories15M.bin models/tokenizer.bin $@
 
+UNICODE_VERSION := 16.0.0
+UCD_URL := https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd
+UCD := target/ucd-$(UNICODE_VERSION)
 # Download and conversion rules for one Qwen3.5 checkpoint.
 # $(1) = model name (directory under models/), $(2) = Hugging Face URL at a pinned revision
 define qwen_rules
@@ -73,6 +76,16 @@ models/$(1).dllm: models/$(1)/model.safetensors models/$(1)/config.json models/$
 endef
 $(eval $(call qwen_rules,qwen3.5-2b,$(QWEN_2B_URL)))
 $(eval $(call qwen_rules,qwen3.5-0.8b,$(QWEN_08B_URL)))
+
+$(UCD)/UnicodeData.txt $(UCD)/PropList.txt:
+	mkdir -p $(UCD)
+	curl -L --fail -o $@ $(UCD_URL)/$(notdir $@)
+
+.PHONY: unicode-classes
+unicode-classes: $(UCD)/UnicodeData.txt $(UCD)/PropList.txt ## Regenerate the tokenizer's Unicode table (changes the model hashes if it changes)
+	cd $(UCD) && shasum -a 256 -c $(CURDIR)/tools/ucd-$(UNICODE_VERSION).sha256
+	cargo run --release --locked --quiet -p detra-dev --bin unicode-classes -- $^ > crates/detra/src/unicode_classes.rs
+	git diff --stat --exit-code crates/detra/src/unicode_classes.rs && echo "unicode_classes.rs: unchanged"
 
 .PHONY: models
 models: $(STORIES) $(QWEN_2B) $(QWEN_08B) ## Download all models, convert them and check all file hashes

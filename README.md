@@ -35,6 +35,7 @@ Disadvantages:
   and the server runs one generation at a time.
 
 [Performance]: #performance
+[uv]: https://docs.astral.sh/uv/
 
 
 ## How It Works
@@ -203,7 +204,9 @@ The `verify` targets compare that output with the files in `golden/`:
 `make verify` runs the tests, the linter, and the first four.
 `make test` runs the test-suite natively in debug and release builds;
 the x86-64, WASM, Miri, and `verify-docker` targets also run it on their architecture.
-`make check-qwen` compares the integer engine
+`make unicode-classes` regenerates the tokenizer's Unicode table
+from the Unicode Character Database (version pinned in the Makefile).
+`make check-qwen` (which needs [uv] for Python and PyTorch) compares the integer engine
 with the Hugging Face float implementation of Qwen3.5-2B
 (`QWEN_MODEL=qwen3.5-0.8b` for the smaller model),
 including the chat template for multi-turn conversations.

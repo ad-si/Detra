@@ -12,3 +12,7 @@ version = "0.1.0"
 dependencies = [
  "detra",
 ]
+
+[[package]]
+name = "detra-dev"
+version = "0.1.0"

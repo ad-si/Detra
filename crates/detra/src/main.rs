@@ -37,8 +37,10 @@ the path of a .dllm file. Without --model, $DETRA_MODEL is used, or else qwen3.5
 Installed models are in $XDG_DATA_HOME/detra (default ~/.local/share/detra).
 
 pull:     downloads a model's checkpoint from Hugging Face (with curl), converts it and
-          checks that the result is bit-identical to the published model. Needs disk
-          space for the checkpoint and the converted model (8.3 GB for qwen3.5-2b).
+          checks that the result is bit-identical to the published model. Files that
+          are already in a Hugging Face cache ($HF_HUB_CACHE, $HF_HOME/hub or
+          ~/.cache/huggingface/hub) with the right SHA-256 are used from there. Needs
+          disk space for the checkpoint and the converted model (8.3 GB for qwen3.5-2b).
 convert:  converts a Hugging Face Qwen3.5 checkpoint directory (config.json,
           tokenizer.json, model.safetensors) and prints the SHA-256 of the result.
 generate: temperature 0 (the default) is greedy decoding. T and P are decimals.
@@ -259,7 +261,7 @@ fn run(args: &[OsString]) -> Result<(), String> {
         }
         ("convert", [dir, out]) => {
             let out = Path::new(out);
-            let sha = pull::convert(Path::new(dir), out)?;
+            let sha = pull::convert(&detra::qwen35::Checkpoint::in_dir(Path::new(dir)), out)?;
             println!("{sha}  {}", out.display());
             Ok(())
         }

@@ -1,8 +1,8 @@
-//! Installing models: download a checkpoint from Hugging Face at a pinned revision,
-//! convert it with the integer-only converter and check that the result is the
-//! published model, bit for bit.
+//! Installing models: download a checkpoint from Hugging Face at a pinned revision
+//! (or find its files in a local Hugging Face cache), convert it with the integer-only
+//! converter and check that the result is the published model, bit for bit.
 
-use detra::qwen35;
+use detra::qwen35::{self, Checkpoint};
 use detra::sha256::{hex, Sha256};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -12,7 +12,7 @@ use std::process::Command;
 pub struct Download {
     /// File name in the Hugging Face repository.
     pub remote: &'static str,
-    /// File name the converter expects.
+    /// File name in detra's download directory.
     pub local: &'static str,
     pub size: u64,
     pub sha256: &'static str,
@@ -20,8 +20,11 @@ pub struct Download {
 
 pub struct Release {
     pub name: &'static str,
-    /// Hugging Face download URL of the repository at a pinned revision.
-    pub url: &'static str,
+    /// Hugging Face repository.
+    pub repo: &'static str,
+    /// Pinned revision of the repository.
+    pub revision: &'static str,
+    /// Config, tokenizer and weights, in this order.
     pub files: [Download; 3],
     /// SHA-256 of the converted model file, which identifies the model.
     pub sha256: &'static str,
@@ -32,7 +35,8 @@ pub const DEFAULT: &str = "qwen3.5-2b";
 pub const RELEASES: [Release; 2] = [
     Release {
         name: "qwen3.5-2b",
-        url: "https://huggingface.co/Qwen/Qwen3.5-2B/resolve/15852e8c16360a2fea060d615a32b45270f8a8fc",
+        repo: "Qwen/Qwen3.5-2B",
+        revision: "15852e8c16360a2fea060d615a32b45270f8a8fc",
         files: [
             Download {
                 remote: "config.json",
@@ -57,7 +61,8 @@ pub const RELEASES: [Release; 2] = [
     },
     Release {
         name: "qwen3.5-0.8b",
-        url: "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/2fc06364715b967f1860aea9cf38778875588b17",
+        repo: "Qwen/Qwen3.5-0.8B",
+        revision: "2fc06364715b967f1860aea9cf38778875588b17",
         files: [
             Download {
                 remote: "config.json",
@@ -112,6 +117,44 @@ fn io(path: &Path) -> impl Fn(std::io::Error) -> String + '_ {
     move |e| format!("{}: {e}", path.display())
 }
 
+/// Hugging Face hub caches, in the order the Hugging Face libraries choose them:
+/// `$HF_HUB_CACHE`, `$HF_HOME/hub`, and `$XDG_CACHE_HOME/huggingface/hub`
+/// (default `~/.cache/huggingface/hub`).
+fn hf_caches() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    dirs.extend(super::env_var("HF_HUB_CACHE").map(PathBuf::from));
+    dirs.extend(super::env_var("HF_HOME").map(|d| Path::new(&d).join("hub")));
+    dirs.extend(env_dir("XDG_CACHE_HOME", ".cache").ok().map(|d| d.join("huggingface").join("hub")));
+    dirs.dedup();
+    dirs
+}
+
+/// A file in a Hugging Face cache with exactly the bytes of `file`, if there is one.
+/// Weights are stored under their SHA-256 in `blobs/`, other files are found through
+/// the snapshots of any revision.
+fn find_cached(release: &Release, file: &Download) -> Option<PathBuf> {
+    let repo_dir = format!("models--{}", release.repo.replace('/', "--"));
+    for hub in hf_caches() {
+        let repo = hub.join(&repo_dir);
+        let mut candidates = vec![repo.join("blobs").join(file.sha256)];
+        if let Ok(entries) = std::fs::read_dir(repo.join("snapshots")) {
+            let mut snapshots: Vec<PathBuf> = entries.filter_map(|e| Some(e.ok()?.path().join(file.remote))).collect();
+            snapshots.sort();
+            candidates.extend(snapshots);
+        }
+        for path in candidates {
+            if !std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == file.size) {
+                continue;
+            }
+            eprintln!("Checking {}", path.display());
+            if hash_file(&path).is_ok_and(|h| h == file.sha256) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// SHA-256 of a file, in hex.
 fn hash_file(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(io(path))?;
@@ -140,7 +183,11 @@ fn download(url: &str, file: &Download, dest: &Path) -> Result<(), String> {
         std::fs::remove_file(&part).map_err(io(&part))?;
     }
     if have != file.size {
-        eprintln!("Downloading {} ({} MB)", file.remote, file.size.div_ceil(1_000_000));
+        let size = match file.size {
+            n if n >= 1_000_000 => format!("{} MB", n.div_ceil(1_000_000)),
+            n => format!("{} kB", n.div_ceil(1_000)),
+        };
+        eprintln!("Downloading {} ({size})", file.remote);
         let status = Command::new("curl")
             .args(["--location", "--fail", "--retry", "5", "--continue-at", "-", "--progress-bar", "--output"])
             .arg(&part)
@@ -181,12 +228,12 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
-/// Convert the checkpoint in `dir` to `out` and return the SHA-256 of the result.
-/// The file appears at `out` only once it is complete.
-pub fn convert(dir: &Path, out: &Path) -> Result<String, String> {
-    let model = qwen35::convert(dir, |step| eprint!("\rConverting: {step:<20}")).map_err(|e| {
+/// Convert `checkpoint` to `out` and return the SHA-256 of the result. The file
+/// appears at `out` only once it is complete.
+pub fn convert(checkpoint: &Checkpoint, out: &Path) -> Result<String, String> {
+    let model = qwen35::convert(checkpoint, |step| eprint!("\rConverting: {step:<20}")).map_err(|e| {
         eprintln!();
-        format!("{}: {e}", dir.display())
+        e.to_string()
     })?;
     eprintln!("\rConverting: done{:<20}", "");
     let mut part = out.as_os_str().to_owned();
@@ -215,29 +262,41 @@ pub fn pull(release: &Release) -> Result<(), String> {
         eprintln!("{} does not hold {}; it will be replaced", dest.display(), release.name);
     }
     let cache = env_dir("XDG_CACHE_HOME", ".cache")?.join("detra").join(release.name);
-    std::fs::create_dir_all(&cache).map_err(io(&cache))?;
+    let mut paths = Vec::new();
     for file in &release.files {
-        download(&format!("{}/{}", release.url, file.remote), file, &cache.join(file.local))?;
+        if let Some(path) = find_cached(release, file) {
+            eprintln!("Using {}", path.display());
+            paths.push(path);
+            continue;
+        }
+        std::fs::create_dir_all(&cache).map_err(io(&cache))?;
+        let url = format!("https://huggingface.co/{}/resolve/{}/{}", release.repo, release.revision, file.remote);
+        let dest = cache.join(file.local);
+        download(&url, file, &dest)?;
+        paths.push(dest);
     }
+    let [config, tokenizer, weights] = <[PathBuf; 3]>::try_from(paths).map_err(|_| "missing checkpoint file")?;
+    let checkpoint = Checkpoint { config, tokenizer, weights };
     let dir = data_dir()?;
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
     let mut converted = dest.as_os_str().to_owned();
     converted.push(".new");
     let converted = PathBuf::from(converted);
-    let got = convert(&cache, &converted)?;
+    let got = convert(&checkpoint, &converted)?;
     if got != release.sha256 {
         let _ = std::fs::remove_file(&converted);
         return Err(format!(
             "the converted model has SHA-256 {got}, expected {}. This is a bug in the converter; \
-             please report it. The download is kept in {}.",
-            release.sha256,
-            cache.display()
+             please report it. The checkpoint was not deleted.",
+            release.sha256
         ));
     }
     std::fs::rename(&converted, &dest).map_err(io(&dest))?;
-    std::fs::remove_dir_all(&cache).map_err(io(&cache))?;
-    if let Some(parent) = cache.parent() {
-        let _ = std::fs::remove_dir(parent); // only succeeds if no other download is in it
+    if cache.exists() {
+        std::fs::remove_dir_all(&cache).map_err(io(&cache))?;
+        if let Some(parent) = cache.parent() {
+            let _ = std::fs::remove_dir(parent); // only succeeds if no other download is in it
+        }
     }
     eprintln!("Installed {} (sha256 {}) at {}", release.name, &got[..16], dest.display());
     Ok(())

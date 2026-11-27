@@ -124,6 +124,10 @@ detra generate "Why is the sky blue?" --max-tokens 100
 `detra pull [model]` downloads a model's checkpoint from Hugging Face
 at a pinned revision (with `curl`), checks its SHA-256,
 converts it, and checks that the result is bit-identical to the published model.
+Checkpoint files that are already in a local Hugging Face cache
+(`$HF_HUB_CACHE`, `$HF_HOME/hub` or `~/.cache/huggingface/hub`,
+as used by `transformers`, `mlx-lm`, vLLM and others)
+are used from there if their SHA-256 matches.
 It needs disk space for the checkpoint and the converted model
 (8.3 GB for `qwen3.5-2b`, 3.3 GB for `qwen3.5-0.8b`),
 and an interrupted download is resumed when the command runs again.

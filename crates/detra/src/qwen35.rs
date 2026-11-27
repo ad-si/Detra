@@ -2,8 +2,8 @@
 //! DLLM format, in integer arithmetic only, so that the converted file is the same on
 //! every machine.
 //!
-//! The checkpoint directory must hold `config.json`, `tokenizer.json` and a single
-//! `model.safetensors`. The vision tower and the multi-token-prediction head are ignored.
+//! A checkpoint is a `config.json`, a `tokenizer.json` and a single `.safetensors`
+//! file. The vision tower and the multi-token-prediction head are ignored.
 //!
 //! - Weights are scaled by 2^24 and rounded to the nearest integer, ties to even.
 //!   Matrices are stored packed when every value allows it.
@@ -23,7 +23,7 @@ use crate::{err, Error, Result};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Context length of converted models (or less, if the model supports less).
 pub const SEQ_LEN: usize = 4096;
@@ -328,10 +328,28 @@ fn a_exp(raw: &Raw, heads: usize) -> Result<Vec<i32>> {
         .collect()
 }
 
-/// Convert the checkpoint in `dir`. `progress` is called with a short description of
-/// each step.
-pub fn convert(dir: &Path, mut progress: impl FnMut(&str)) -> Result<Model> {
-    let config = json::parse(&read_file(&dir.join("config.json"))?)?;
+/// The files of a checkpoint.
+pub struct Checkpoint {
+    pub config: PathBuf,
+    pub tokenizer: PathBuf,
+    pub weights: PathBuf,
+}
+
+impl Checkpoint {
+    /// The checkpoint in a directory with `config.json`, `tokenizer.json` and
+    /// `model.safetensors`.
+    pub fn in_dir(dir: &Path) -> Checkpoint {
+        Checkpoint {
+            config: dir.join("config.json"),
+            tokenizer: dir.join("tokenizer.json"),
+            weights: dir.join("model.safetensors"),
+        }
+    }
+}
+
+/// Convert a checkpoint. `progress` is called with a short description of each step.
+pub fn convert(files: &Checkpoint, mut progress: impl FnMut(&str)) -> Result<Model> {
+    let config = json::parse(&read_file(&files.config)?)?;
     let cfg = member(&config, "text_config")?;
     let unsupported = |what: &str| Error(format!("unsupported model configuration: {what}"));
     if !flag(cfg, "tie_word_embeddings")? {
@@ -391,7 +409,7 @@ pub fn convert(dir: &Path, mut progress: impl FnMut(&str)) -> Result<Model> {
     let conv_dim = 2 * key_dim + value_dim;
     let out_gate = flag(cfg, "attn_output_gate")?;
 
-    let mut st = SafeTensors::open(&dir.join("model.safetensors"))?;
+    let mut st = SafeTensors::open(&files.weights)?;
     let lm = "model.language_model.";
     progress("embeddings");
     let tok_emb = st.get(&format!("{lm}embed_tokens.weight"))?.matrix(&[vocab_size, dim])?;
@@ -440,7 +458,7 @@ pub fn convert(dir: &Path, mut progress: impl FnMut(&str)) -> Result<Model> {
     let (rope_cos, rope_sin) = rope_tables(theta, rotary_dim, seq_len)?;
 
     progress("tokenizer");
-    let tok = json::parse(&read_file(&dir.join("tokenizer.json"))?)?;
+    let tok = json::parse(&read_file(&files.tokenizer)?)?;
     let tok_model = member(&tok, "model")?;
     let normalizer = tok.get("normalizer").map(Value::to_json);
     if member(tok_model, "type")?.as_str() != Some("BPE") || normalizer.as_deref() != Some(r#"{"type":"NFC"}"#) {

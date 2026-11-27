@@ -3,6 +3,7 @@ name = "detra-convert"
 description = "Offline converter from llama2.c float checkpoints to the integer-only DLLM format"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 detra = { path = "../detra" }

@@ -5,6 +5,7 @@ members = ["crates/detra", "crates/detra-convert"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "ISC"
 
 [profile.release]
 opt-level = 3

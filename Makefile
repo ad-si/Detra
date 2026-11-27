@@ -11,17 +11,17 @@ QWEN := models/qwen3.5-0.8b.dllm
 GOLDEN_STORIES := golden/stories15M.digests
 GOLDEN_QWEN := golden/qwen3.5-0.8b.digests
 RUST_IMAGE ?= rust:1-slim
-DATA_DIR := $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/detllm
-MIRI_TEST := cargo +nightly miri test -p detllm --test synthetic
+DATA_DIR := $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/detra
+MIRI_TEST := cargo +nightly miri test -p detra --test synthetic
 
-# $(1) = detllm command, $(2) = model, $(3) = golden file, $(4) = label
+# $(1) = detra command, $(2) = model, $(3) = golden file, $(4) = label
 check = $(1) digest golden/prompts.txt --model $(2) | diff - $(3) && echo "$(4): bit-exact"
 
 # Build inside an emulated Linux container and compare its digests with the golden file.
 # $(1) = docker platform
 docker_verify = docker run --rm --platform $(1) -v "$(CURDIR)":/src:ro -w /src \
 	-e CARGO_TARGET_DIR=/tmp/target $(RUST_IMAGE) sh -c \
-	'cargo test --release --locked -p detllm 2>&1 | grep "test result" >&2; /tmp/target/release/detllm digest golden/prompts.txt --model $(STORIES)' \
+	'cargo test --release --locked -p detra 2>&1 | grep "test result" >&2; /tmp/target/release/detra digest golden/prompts.txt --model $(STORIES)' \
 	| diff - $(GOLDEN_STORIES) && echo "$(1) stories15M: bit-exact"
 
 .PHONY: help
@@ -40,7 +40,7 @@ test: ## Run unit tests and the synthetic-model determinism tests (debug and rel
 .PHONY: lint
 lint: ## Clippy, plus a check that the engine crate contains no floating point
 	cargo clippy --locked --all-targets -- -D warnings
-	uv run --no-project scripts/no-float.py crates/detllm
+	uv run --no-project scripts/no-float.py crates/detra
 
 models/stories15M.bin:
 	curl -L --fail -o $@ $(STORIES_URL)
@@ -49,7 +49,7 @@ models/tokenizer.bin:
 	curl -L --fail -o $@ $(STORIES_TOK_URL)
 
 $(STORIES): models/stories15M.bin models/tokenizer.bin | build
-	target/release/detllm-convert convert models/stories15M.bin models/tokenizer.bin $@
+	target/release/detra-convert convert models/stories15M.bin models/tokenizer.bin $@
 
 $(QWEN_DIR)/model.safetensors:
 	mkdir -p $(QWEN_DIR)
@@ -68,31 +68,31 @@ models: $(STORIES) $(QWEN) ## Download both models, convert them and check all f
 
 .PHONY: golden
 golden: models ## Regenerate the golden digests on this machine
-	target/release/detllm digest golden/prompts.txt --model $(STORIES) > $(GOLDEN_STORIES)
-	target/release/detllm digest golden/prompts.txt --model $(QWEN) > $(GOLDEN_QWEN)
+	target/release/detra digest golden/prompts.txt --model $(STORIES) > $(GOLDEN_STORIES)
+	target/release/detra digest golden/prompts.txt --model $(QWEN) > $(GOLDEN_QWEN)
 
 .PHONY: verify-native
 verify-native: models ## Native release build against the golden digests
-	$(call check,target/release/detllm,$(STORIES),$(GOLDEN_STORIES),native stories15M)
-	$(call check,target/release/detllm,$(QWEN),$(GOLDEN_QWEN),native qwen3.5-0.8b)
-	$(call check,DETLLM_THREADS=1 target/release/detllm,$(QWEN),$(GOLDEN_QWEN),native qwen3.5-0.8b single-threaded)
+	$(call check,target/release/detra,$(STORIES),$(GOLDEN_STORIES),native stories15M)
+	$(call check,target/release/detra,$(QWEN),$(GOLDEN_QWEN),native qwen3.5-0.8b)
+	$(call check,DETRA_THREADS=1 target/release/detra,$(QWEN),$(GOLDEN_QWEN),native qwen3.5-0.8b single-threaded)
 
 .PHONY: verify-debug
 verify-debug: models ## Unoptimized build with overflow checks enabled (small model)
-	cargo build --locked -p detllm
-	$(call check,target/debug/detllm,$(STORIES),$(GOLDEN_STORIES),native debug stories15M)
+	cargo build --locked -p detra
+	$(call check,target/debug/detra,$(STORIES),$(GOLDEN_STORIES),native debug stories15M)
 
 .PHONY: verify-x86_64
 verify-x86_64: models ## x86-64 build run under Rosetta
-	cargo test --release --locked -p detllm --target x86_64-apple-darwin
-	$(call check,target/x86_64-apple-darwin/release/detllm,$(STORIES),$(GOLDEN_STORIES),x86_64 stories15M)
-	$(call check,target/x86_64-apple-darwin/release/detllm,$(QWEN),$(GOLDEN_QWEN),x86_64 qwen3.5-0.8b)
+	cargo test --release --locked -p detra --target x86_64-apple-darwin
+	$(call check,target/x86_64-apple-darwin/release/detra,$(STORIES),$(GOLDEN_STORIES),x86_64 stories15M)
+	$(call check,target/x86_64-apple-darwin/release/detra,$(QWEN),$(GOLDEN_QWEN),x86_64 qwen3.5-0.8b)
 
 .PHONY: verify-wasm
 verify-wasm: models ## WebAssembly (32-bit) build run under Node's WASI (small model)
-	CARGO_TARGET_WASM32_WASIP1_RUNNER="node --no-warnings $(CURDIR)/scripts/wasi-run.mjs" cargo test --release --locked -p detllm --target wasm32-wasip1
-	cargo build --release --locked -p detllm --target wasm32-wasip1
-	$(call check,node --no-warnings scripts/wasi-run.mjs target/wasm32-wasip1/release/detllm.wasm,$(STORIES),$(GOLDEN_STORIES),wasm32 stories15M)
+	CARGO_TARGET_WASM32_WASIP1_RUNNER="node --no-warnings $(CURDIR)/scripts/wasi-run.mjs" cargo test --release --locked -p detra --target wasm32-wasip1
+	cargo build --release --locked -p detra --target wasm32-wasip1
+	$(call check,node --no-warnings scripts/wasi-run.mjs target/wasm32-wasip1/release/detra.wasm,$(STORIES),$(GOLDEN_STORIES),wasm32 stories15M)
 
 .PHONY: verify-miri
 verify-miri: ## Synthetic models interpreted for big-endian 64-bit and for 32-bit targets (slow)
@@ -114,7 +114,7 @@ verify-docker: models ## Small model on emulated big-endian s390x, 32-bit x86 an
 verify-docker-qwen: models ## Qwen3.5 on emulated big-endian s390x Linux (needs Docker, very slow)
 	docker run --rm --platform linux/s390x -v "$(CURDIR)":/src:ro -w /src \
 		-e CARGO_TARGET_DIR=/tmp/target $(RUST_IMAGE) sh -c \
-		'cargo build --release --locked -p detllm 2>&1 >/dev/null | tail -1 >&2; /tmp/target/release/detllm digest golden/prompts.txt --model $(QWEN)' \
+		'cargo build --release --locked -p detra 2>&1 >/dev/null | tail -1 >&2; /tmp/target/release/detra digest golden/prompts.txt --model $(QWEN)' \
 		| diff - $(GOLDEN_QWEN) && echo "linux/s390x qwen3.5-0.8b: bit-exact"
 
 .PHONY: check-qwen
@@ -123,19 +123,19 @@ check-qwen: models ## Compare Qwen3.5 on the integer engine with the Hugging Fac
 
 .PHONY: serve
 serve: build $(QWEN) ## Serve Qwen3.5 as an OpenAI-compatible chat API on http://127.0.0.1:8080/v1
-	target/release/detllm serve --model $(QWEN)
+	target/release/detra serve --model $(QWEN)
 
 .PHONY: install
-install: build $(QWEN) ## Install the `detllm` CLI (cargo bin dir) and Qwen3.5-0.8B ($XDG_DATA_HOME/detllm)
-	cargo install --locked --path crates/detllm
+install: build $(QWEN) ## Install the `detra` CLI (cargo bin dir) and Qwen3.5-0.8B ($XDG_DATA_HOME/detra)
+	cargo install --locked --path crates/detra
 	mkdir -p "$(DATA_DIR)"
 	cp $(QWEN) "$(DATA_DIR)/model.dllm"
-	@echo 'Installed. Try: detllm generate "Why is the sky blue?" --max-tokens 100'
-	@echo 'or point a chat front end at `detllm serve` (http://127.0.0.1:8080/v1).'
+	@echo 'Installed. Try: detra generate "Why is the sky blue?" --max-tokens 100'
+	@echo 'or point a chat front end at `detra serve` (http://127.0.0.1:8080/v1).'
 
 .PHONY: uninstall
 uninstall: ## Remove the installed CLI and model
-	cargo uninstall detllm
+	cargo uninstall detra
 	rm -f "$(DATA_DIR)/model.dllm"
 	-rmdir "$(DATA_DIR)"
 

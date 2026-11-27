@@ -541,7 +541,7 @@ impl Server<'_> {
             ("GET", "/v1/models") => reply(
                 200,
                 &format!(
-                    "{{\"object\":\"list\",\"data\":[{{\"id\":{},\"object\":\"model\",\"created\":0,\"owned_by\":\"detllm\"}}]}}",
+                    "{{\"object\":\"list\",\"data\":[{{\"id\":{},\"object\":\"model\",\"created\":0,\"owned_by\":\"detra\"}}]}}",
                     quote(&self.config.name)
                 ),
             ),
@@ -598,7 +598,7 @@ impl Server<'_> {
             hasher.update(stop.as_bytes());
         }
         let id = format!("chatcmpl-{}", &hex(&hasher.finalize())[..24]);
-        let fingerprint = format!("detllm-{}", &hex(&self.config.model_id)[..16]);
+        let fingerprint = format!("detra-{}", &hex(&self.config.model_id)[..16]);
         let common = format!(
             "\"id\":\"{id}\",\"created\":0,\"model\":{},\"system_fingerprint\":\"{fingerprint}\"",
             quote(&self.config.name)

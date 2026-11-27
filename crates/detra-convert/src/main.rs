@@ -8,17 +8,17 @@
 //! much the fixed-point arithmetic changes the model. It is a diagnostic and its float
 //! side is not reproducible across machines.
 
-use detllm::generate::{generate, GenParams};
-use detllm::model::{Attention, Layer, Mixer, Model, Tensor, Vocab};
+use detra::generate::{generate, GenParams};
+use detra::model::{Attention, Layer, Mixer, Model, Tensor, Vocab};
 use std::sync::Arc;
-use detllm::sample::{argmax, SampleParams};
-use detllm::sha256::{hex, sha256};
+use detra::sample::{argmax, SampleParams};
+use detra::sha256::{hex, sha256};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
 Usage:
-  detllm-convert convert <llama2c-model.bin> <tokenizer.bin> <out.dllm>
-  detllm-convert compare <llama2c-model.bin> <model.dllm> <prompt> [max-tokens]";
+  detra-convert convert <llama2c-model.bin> <tokenizer.bin> <out.dllm>
+  detra-convert compare <llama2c-model.bin> <model.dllm> <prompt> [max-tokens]";
 
 const BOS_ID: u32 = 1;
 const EOS_ID: u32 = 2;

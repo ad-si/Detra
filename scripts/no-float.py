@@ -91,7 +91,7 @@ def findings(text):
 
 def main():
     status = 0
-    for root in sys.argv[1:] or ["crates/detllm"]:
+    for root in sys.argv[1:] or ["crates/detra"]:
         for path in sorted(Path(root).rglob("*.rs")):
             for line, token in findings(path.read_text()):
                 print(f"{path}:{line}: floating point: {token}", file=sys.stderr)

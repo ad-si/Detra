@@ -1,4 +1,4 @@
-# detllm
+# Detra
 
 Bit-exact, integer-only LLM inference engine written in Rust.
 No floating point, no dependencies.
@@ -18,13 +18,13 @@ on every machine, build profile, and target.
 - Every operation that may overflow uses explicit wrapping arithmetic,
   so debug and release builds agree.
 - No dependence on pointer width, endianness, hash-map iteration order,
-  or the number of threads (`$DETLLM_THREADS` changes the speed, never the output).
+  or the number of threads (`$DETRA_THREADS` changes the speed, never the output).
   Threads only ever compute independent blocks of wrapping integer sums,
   so neither their number nor their scheduling can affect a result.
 - Sampling (temperature, top-k, top-p) is seeded and also integer-only.
 - The identity of a model is the SHA-256 of its converted `.dllm` file.
   Floating point is only used in the offline converters
-  (`detllm-convert` and `tools/convert_qwen35.py`).
+  (`detra-convert` and `tools/convert_qwen35.py`).
 
 Two models are supported:
 
@@ -81,22 +81,22 @@ where arguments are not raw bytes (use `--prompt-file` there).
 
 ```sh
 make install
-detllm generate "Why is the sky blue?" --max-tokens 100
+detra generate "Why is the sky blue?" --max-tokens 100
 ```
 
 ```txt
-detllm generate <prompt> [--max-tokens N] [--temperature T] [--top-k K]
+detra generate <prompt> [--max-tokens N] [--temperature T] [--top-k K]
                 [--top-p P] [--seed S] [--model model.dllm]
-detllm generate --prompt-file <path> [...]
-detllm info [--model model.dllm]
-detllm digest <prompts.txt> [--max-tokens N] [--model model.dllm]
-detllm trace <prompt> | --messages <chat.json> [--max-tokens N] [--logits out.bin]
-detllm serve [--port N] [--host H] [--allow-origin URL] [--model model.dllm]
+detra generate --prompt-file <path> [...]
+detra info [--model model.dllm]
+detra digest <prompts.txt> [--max-tokens N] [--model model.dllm]
+detra trace <prompt> | --messages <chat.json> [--max-tokens N] [--logits out.bin]
+detra serve [--port N] [--host H] [--allow-origin URL] [--model model.dllm]
 ```
 
-Without `--model`, `$DETLLM_MODEL` is used,
-or else `$XDG_DATA_HOME/detllm/model.dllm`
-(default `~/.local/share/detllm/model.dllm`).
+Without `--model`, `$DETRA_MODEL` is used,
+or else `$XDG_DATA_HOME/detra/model.dllm`
+(default `~/.local/share/detra/model.dllm`).
 Temperature 0 (the default) is greedy decoding.
 The text is printed as it is generated.
 The prompt is used byte for byte; `--prompt-file` reads it from a file
@@ -107,14 +107,14 @@ Put `--` before a prompt that starts with dashes.
 ## Chat Server
 
 ```sh
-detllm serve                # http://127.0.0.1:8080/v1
+detra serve                # http://127.0.0.1:8080/v1
 ```
 
-`detllm serve [--port N] [--host H] [--allow-origin URL] [--record log.jsonl] [--model model.dllm]`
+`detra serve [--port N] [--host H] [--allow-origin URL] [--record log.jsonl] [--model model.dllm]`
 serves an OpenAI-compatible API, so any chat front end
 that talks to OpenAI-compatible servers can use it
 (e.g. Open WebUI, LibreChat, Chatbox, Jan, or the `openai` client libraries).
-Set the base URL to `http://127.0.0.1:8080/v1`, any API key, and model `detllm`.
+Set the base URL to `http://127.0.0.1:8080/v1`, any API key, and model `detra`.
 
 - `POST /v1/chat/completions`: system, user and assistant messages,
   `stream` (server-sent events, with `stream_options.include_usage`),
@@ -154,7 +154,7 @@ There is no authentication, so do not expose it to a network you do not trust.
 
 ## Verification
 
-`detllm digest` runs every prompt in `golden/prompts.txt` greedily
+`detra digest` runs every prompt in `golden/prompts.txt` greedily
 and with seeded sampling and prints a SHA-256
 over all hidden states, logits, and tokens (or the error).
 The `verify` targets compare that output with the files in `golden/`:
@@ -186,8 +186,8 @@ Qwen3.5-0.8B on an Apple M4 Max (10 performance cores), greedy decoding,
 
 | Runtime                          | Prompt       | Generation  | Peak memory |
 | -------------------------------- | ------------ | ----------- | ----------- |
-| detllm (integer, CPU)            | ~105 tok/s   | ~65 tok/s   | 1.5 GiB     |
-| detllm (integer, CPU, 1 thread)  | ~18 tok/s    | ~12 tok/s   | 1.5 GiB     |
+| Detra (integer, CPU)             | ~105 tok/s   | ~65 tok/s   | 1.5 GiB     |
+| Detra (integer, CPU, 1 thread)   | ~18 tok/s    | ~12 tok/s   | 1.5 GiB     |
 | MLX (bfloat16, GPU)              | ~7800 tok/s  | ~185 tok/s  | 1.5 GiB     |
 
 Generation is limited by memory bandwidth (every token reads all weights once),

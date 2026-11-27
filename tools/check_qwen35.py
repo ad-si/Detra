@@ -4,7 +4,7 @@
 # ///
 """Compare the integer engine with the Hugging Face float implementation of Qwen3.5.
 
-Usage: uv run tools/check_qwen35.py <model-dir> <model.dllm> [detllm-binary]
+Usage: uv run tools/check_qwen35.py <model-dir> <model.dllm> [detra-binary]
 
 Checks, per prompt: the prompt token ids (tokenizer and chat template), the logits of
 the first predicted token, and the greedy continuation. This is a fidelity diagnostic:
@@ -90,7 +90,7 @@ def main():
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
     src, dllm = sys.argv[1], sys.argv[2]
-    binary = sys.argv[3] if len(sys.argv) > 3 else "target/release/detllm"
+    binary = sys.argv[3] if len(sys.argv) > 3 else "target/release/detra"
     tok = AutoTokenizer.from_pretrained(src)
 
     def prompt_ids(text):

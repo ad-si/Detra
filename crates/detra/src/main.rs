@@ -1,15 +1,15 @@
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
-use detllm::fixed::{parse_q16, ONE_Q16};
-use detllm::chat::{chat_tokens, Role};
-use detllm::engine::Session;
-use detllm::generate::{feed_prompt, generate, run_digest, sample_tokens, GenParams};
-use detllm::server::parse_messages;
-use detllm::model::Model;
-use detllm::sample::SampleParams;
-use detllm::server::{serve, Config};
-use detllm::sha256::{hex, Sha256};
-use detllm::tokenizer::Tokenizer;
+use detra::fixed::{parse_q16, ONE_Q16};
+use detra::chat::{chat_tokens, Role};
+use detra::engine::Session;
+use detra::generate::{feed_prompt, generate, run_digest, sample_tokens, GenParams};
+use detra::server::parse_messages;
+use detra::model::Model;
+use detra::sample::SampleParams;
+use detra::server::{serve, Config};
+use detra::sha256::{hex, Sha256};
+use detra::tokenizer::Tokenizer;
 use std::ffi::OsString;
 use std::io::{BufReader, Read, Write};
 use std::process::ExitCode;
@@ -17,18 +17,18 @@ use std::sync::Arc;
 
 const USAGE: &str = "\
 Usage:
-  detllm generate <prompt> [--max-tokens N] [--temperature T] [--top-k K]
+  detra generate <prompt> [--max-tokens N] [--temperature T] [--top-k K]
                   [--top-p P] [--seed S] [--model model.dllm]
-  detllm generate --prompt-file <path> [...]
-  detllm info [--model model.dllm]
-  detllm digest <prompts.txt> [--max-tokens N] [--model model.dllm]
-  detllm trace <prompt> [--max-tokens N] [--logits out.bin] [--model model.dllm]
-  detllm trace --messages <chat.json> [...]
-  detllm serve [--port 8080] [--host 127.0.0.1] [--allow-origin URL] [--record log.jsonl]
+  detra generate --prompt-file <path> [...]
+  detra info [--model model.dllm]
+  detra digest <prompts.txt> [--max-tokens N] [--model model.dllm]
+  detra trace <prompt> [--max-tokens N] [--logits out.bin] [--model model.dllm]
+  detra trace --messages <chat.json> [...]
+  detra serve [--port 8080] [--host 127.0.0.1] [--allow-origin URL] [--record log.jsonl]
                [--model model.dllm]
 
-Without --model, $DETLLM_MODEL is used, or else
-$XDG_DATA_HOME/detllm/model.dllm (default ~/.local/share/detllm/model.dllm).
+Without --model, $DETRA_MODEL is used, or else
+$XDG_DATA_HOME/detra/model.dllm (default ~/.local/share/detra/model.dllm).
 
 generate: temperature 0 (the default) is greedy decoding. T and P are decimals.
           The prompt is used byte for byte; --prompt-file reads it from a file (every
@@ -48,7 +48,7 @@ trace:    prints the token ids of the prompt and of the greedy continuation, and
           --messages takes a conversation instead, as a JSON list of
           {\"role\": ..., \"content\": ...} objects in the chat API's format.
 
-$DETLLM_THREADS sets the number of threads. It changes the speed, never the output.";
+$DETRA_THREADS sets the number of threads. It changes the speed, never the output.";
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -150,25 +150,25 @@ fn env_var(name: &str) -> Option<String> {
 /// Location of the installed model. Only the CLI looks at the environment; the engine
 /// itself takes model bytes and nothing else.
 fn model_path(explicit: Option<&String>) -> Result<String, String> {
-    if let Some(path) = explicit.cloned().or_else(|| env_var("DETLLM_MODEL")) {
+    if let Some(path) = explicit.cloned().or_else(|| env_var("DETRA_MODEL")) {
         return Ok(path);
     }
     let data_dir = match (env_var("XDG_DATA_HOME"), env_var("HOME")) {
         (Some(dir), _) => dir,
         (None, Some(home)) => format!("{home}/.local/share"),
-        (None, None) => return Err("no --model given and neither DETLLM_MODEL nor HOME is set".into()),
+        (None, None) => return Err("no --model given and neither DETRA_MODEL nor HOME is set".into()),
     };
-    Ok(format!("{data_dir}/detllm/model.dllm"))
+    Ok(format!("{data_dir}/detra/model.dllm"))
 }
 
 fn threads() -> Result<usize, String> {
     if cfg!(target_family = "wasm") {
         return Ok(1);
     }
-    match env_var("DETLLM_THREADS") {
+    match env_var("DETRA_THREADS") {
         Some(v) => match v.parse::<u32>() {
             Ok(n) => Ok(n.clamp(1, 256) as usize),
-            Err(_) => Err(format!("invalid DETLLM_THREADS: {v}")),
+            Err(_) => Err(format!("invalid DETRA_THREADS: {v}")),
         },
         None => Ok(performance_cores().unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))),
     }
@@ -373,7 +373,7 @@ fn run(args: &[OsString]) -> Result<(), String> {
                 }
                 None => None,
             };
-            let name = "detllm".to_string();
+            let name = "detra".to_string();
             eprintln!("Serving model `{name}` (sha256 {}) at http://{addr}/v1", &hex(&id)[..16]);
             let allow_origin = o.allow_origin;
             serve(listener, Config { model: m, model_id: id, name, threads, allow_origin, log: true, record });

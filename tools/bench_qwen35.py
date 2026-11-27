@@ -4,12 +4,12 @@
 # ///
 """Benchmark the integer engine against float implementations of Qwen3.5-0.8B.
 
-Usage: uv run tools/bench_qwen35.py <model-dir> <model.dllm> [--torch] [detllm-binary]
+Usage: uv run tools/bench_qwen35.py <model-dir> <model.dllm> [--torch] [detra-binary]
 
 Measures model load time, prompt throughput, generation throughput and peak memory
 for the same prompts with greedy decoding:
 
-- detllm: the integer engine, all threads and single-threaded (CPU only).
+- detra: the integer engine, all threads and single-threaded (CPU only).
 - MLX: float (bfloat16) on the GPU via mlx-lm, loaded from the same checkpoint.
 - with --torch: the Hugging Face PyTorch implementation in float32 on the CPU. It
   uses unoptimised fallback kernels for the recurrent layers and is very slow.
@@ -30,9 +30,9 @@ LONG = PARAGRAPH * 24 + "Summarise the text above in one sentence."
 NEW_TOKENS = 200
 
 
-def detllm_run(binary, dllm, prompt, max_tokens, threads):
-    """Wall time, peak memory (bytes) and token counts of one `detllm trace` run."""
-    env = {"DETLLM_THREADS": str(threads)} if threads else {}
+def detra_run(binary, dllm, prompt, max_tokens, threads):
+    """Wall time, peak memory (bytes) and token counts of one `detra trace` run."""
+    env = {"DETRA_THREADS": str(threads)} if threads else {}
     cmd = ["/usr/bin/time", "-l", binary, "trace", "--max-tokens", str(max_tokens), "--model", dllm, "--", prompt]
     start = time.perf_counter()
     out = subprocess.run(cmd, check=True, capture_output=True, text=True, env={**__import__("os").environ, **env})
@@ -43,12 +43,12 @@ def detllm_run(binary, dllm, prompt, max_tokens, threads):
     return wall, peak, counts[0], counts[1], tokens[1]
 
 
-def bench_detllm(binary, dllm, threads, label):
+def bench_detra(binary, dllm, threads, label):
     # Differences between runs isolate the phases: an empty generation gives load +
     # prompt time, a longer prompt gives the prompt rate, more tokens the generation rate.
-    base, _, n_short, _, _ = detllm_run(binary, dllm, SHORT, 0, threads)
-    gen, peak, _, n_new, tokens = detllm_run(binary, dllm, SHORT, NEW_TOKENS, threads)
-    long, _, n_long, _, _ = detllm_run(binary, dllm, LONG, 0, threads)
+    base, _, n_short, _, _ = detra_run(binary, dllm, SHORT, 0, threads)
+    gen, peak, _, n_new, tokens = detra_run(binary, dllm, SHORT, NEW_TOKENS, threads)
+    long, _, n_long, _, _ = detra_run(binary, dllm, LONG, 0, threads)
     prompt_tps = (n_long - n_short) / (long - base)
     load = base - n_short / prompt_tps
     report(label, load, prompt_tps, n_new / (gen - base), peak, n_long, n_new)
@@ -123,12 +123,12 @@ def main():
     if len(args) < 2:
         raise SystemExit(__doc__)
     src, dllm = args[0], args[1]
-    binary = args[2] if len(args) > 2 else "target/release/detllm"
-    ours = bench_detllm(binary, dllm, None, "detllm integer (CPU, all threads)")
-    bench_detllm(binary, dllm, 1, "detllm integer (CPU, 1 thread)")
+    binary = args[2] if len(args) > 2 else "target/release/detra"
+    ours = bench_detra(binary, dllm, None, "detra integer (CPU, all threads)")
+    bench_detra(binary, dllm, 1, "detra integer (CPU, 1 thread)")
     theirs = bench_mlx(src)
     same = next((i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b), min(len(ours), len(theirs)))
-    print(f"detllm and MLX agree on the first {same} of {min(len(ours), len(theirs))} generated tokens")
+    print(f"detra and MLX agree on the first {same} of {min(len(ours), len(theirs))} generated tokens")
     if "--torch" in sys.argv:
         bench_torch(src)
 

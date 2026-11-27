@@ -2,13 +2,13 @@
 //! constants: every platform, compiler, optimization level and thread count must
 //! reproduce them.
 
-use detllm::chat::{chat_tokens, Role};
-use detllm::engine::Session;
-use detllm::generate::{feed_prompt, run_digest, sample_tokens, GenParams};
-use detllm::model::{Attention, Chat, Delta, Layer, Mixer, Model, Tensor, Turn, Vocab};
-use detllm::sample::{Rng, SampleParams};
-use detllm::sha256::{hex, sha256};
-use detllm::tokenizer::Tokenizer;
+use detra::chat::{chat_tokens, Role};
+use detra::engine::Session;
+use detra::generate::{feed_prompt, run_digest, sample_tokens, GenParams};
+use detra::model::{Attention, Chat, Delta, Layer, Mixer, Model, Tensor, Turn, Vocab};
+use detra::sample::{Rng, SampleParams};
+use detra::sha256::{hex, sha256};
+use detra::tokenizer::Tokenizer;
 use std::sync::Arc;
 
 struct Weights(Rng);
@@ -481,7 +481,7 @@ fn random_params(rng: &mut Rng) -> GenParams {
 fn fuzz_digest(model: Model, seed: u64, cases: usize) -> String {
     let model = Arc::new(model);
     let mut rng = Rng::new(seed);
-    let mut all = detllm::sha256::Sha256::new();
+    let mut all = detra::sha256::Sha256::new();
     let mut completed = 0;
     for _ in 0..cases {
         let prompt = random_prompt(&mut rng);
@@ -521,7 +521,7 @@ fn extreme_weights_have_fixed_digests() {
 #[test]
 #[cfg_attr(miri, ignore = "too slow under Miri")]
 fn corrupted_model_files_have_fixed_outcomes() {
-    let mut all = detllm::sha256::Sha256::new();
+    let mut all = detra::sha256::Sha256::new();
     let (mut loaded, mut rejected) = (0, 0);
     for (model, seed) in [(llama_like(), 11), (qwen_like(), 12)] {
         let bytes = model.to_bytes().unwrap();
@@ -643,7 +643,7 @@ fn resumed_sessions_match_fresh_ones() {
     assert_eq!(resumed, fresh);
     assert!(feed_prompt(&mut kept, &second, true, |_, _| {}).is_err(), "a session ahead of its prompt");
 
-    let mut digest = detllm::sha256::Sha256::new();
+    let mut digest = detra::sha256::Sha256::new();
     digest.update_u32s(&fresh.0);
     digest.update_i32s(&fresh.1);
     assert_eq!(hex(&digest.finalize()), "1f80d18434719406d850b772f805509cfeeedd62680808c863fde28079c80cb3");
@@ -674,7 +674,7 @@ impl std::io::Write for Collected {
 
 #[cfg(not(any(miri, target_family = "wasm")))]
 fn start_recording_server(record: Option<Collected>) -> std::net::SocketAddr {
-    use detllm::server::{serve, Config};
+    use detra::server::{serve, Config};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let config = Config {
@@ -740,8 +740,8 @@ fn contents(body: &str) -> Vec<String> {
     };
     let mut out = Vec::new();
     for doc in documents {
-        let v = detllm::json::parse(doc.as_bytes()).unwrap();
-        let Some(detllm::json::Value::Array(choices)) = v.get("choices") else { panic!("{doc}") };
+        let v = detra::json::parse(doc.as_bytes()).unwrap();
+        let Some(detra::json::Value::Array(choices)) = v.get("choices") else { panic!("{doc}") };
         for choice in choices {
             if let Some(text) = choice.get("message").or(choice.get("delta")).and_then(|m| m.get("content")) {
                 out.push(text.as_str().unwrap().to_string());
@@ -758,7 +758,7 @@ fn server_replies_are_fixed() {
     let chat = r#"{"model":"test","messages":[{"role":"system","content":"x"},{"role":"user","content":"the and"}],"max_tokens":12,"temperature":0.8,"seed":5"#;
     let (status, _, body) = post(addr, &format!("{chat}}}"));
     assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
-    assert_eq!(hex(&sha256(body.as_bytes())), "a5dbcfc2dbc5f96e246b08723dc94f2d48c6fa220e4bd8c7607aa1f84b7571f1");
+    assert_eq!(hex(&sha256(body.as_bytes())), "de7666f83d58fd5da6f819e77a0e09f64b0e9afe527d16c3dd4e5b0447325c4c");
     // The same request again (now from a kept session) and from a fresh server.
     assert_eq!(post(addr, &format!("{chat}}}")).2, body);
     assert_eq!(post(start_server(), &format!("{chat}}}")).2, body);
@@ -779,10 +779,10 @@ fn server_replies_are_fixed() {
     // A stop string ends the reply before it, in both forms.
     let cut = reply.char_indices().nth(4).map_or(reply.len(), |(i, _)| i);
     let stop = &reply[cut..reply.len().min(cut + 3)];
-    let stopped = format!("{chat},\"stop\":[{}]}}", detllm::json::quote(stop));
+    let stopped = format!("{chat},\"stop\":[{}]}}", detra::json::quote(stop));
     let text = contents(&post(addr, &stopped).2).concat();
     assert_eq!(text, &reply[..reply.find(stop).unwrap()]);
-    let stopped = format!("{chat},\"stop\":[{}],\"stream\":true}}", detllm::json::quote(stop));
+    let stopped = format!("{chat},\"stop\":[{}],\"stream\":true}}", detra::json::quote(stop));
     assert_eq!(contents(&post(addr, &stopped).2).concat(), text);
 }
 
@@ -792,7 +792,7 @@ fn server_handles_other_requests() {
     let addr = start_server();
     let get = |path: &str, extra: &str| http(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n{extra}\r\n"));
     let (status, _, body) = get("/v1/models", "");
-    assert_eq!((status.as_str(), body.as_str()), ("HTTP/1.1 200 OK", r#"{"object":"list","data":[{"id":"test","object":"model","created":0,"owned_by":"detllm"}]}"#));
+    assert_eq!((status.as_str(), body.as_str()), ("HTTP/1.1 200 OK", r#"{"object":"list","data":[{"id":"test","object":"model","created":0,"owned_by":"detra"}]}"#));
     assert_eq!(get("/health", "").0, "HTTP/1.1 200 OK");
     assert_eq!(get("/nope", "").0, "HTTP/1.1 404 Not Found");
     assert_eq!(get("/v1/chat/completions", "").0, "HTTP/1.1 405 Method Not Allowed");
@@ -817,7 +817,7 @@ fn server_handles_other_requests() {
 #[test]
 #[cfg(not(any(miri, target_family = "wasm")))]
 fn server_records_interactions() {
-    use detllm::json::{parse, Value};
+    use detra::json::{parse, Value};
     let record = Collected::default();
     let addr = start_recording_server(Some(record.clone()));
     let chat = "{\"messages\": [{\"role\":\"user\",\n \"content\":\"the\\nand\"}], \"max_tokens\": 5, \"seed\": 2.0e0}";

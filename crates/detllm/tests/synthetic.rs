@@ -2,8 +2,10 @@
 //! constants: every platform, compiler, optimization level and thread count must
 //! reproduce them.
 
-use detllm::generate::{run_digest, GenParams};
-use detllm::model::{Attention, Delta, Layer, Mixer, Model, Tensor, Vocab};
+use detllm::chat::{chat_tokens, Role};
+use detllm::engine::Session;
+use detllm::generate::{feed_prompt, run_digest, sample_tokens, GenParams};
+use detllm::model::{Attention, Chat, Delta, Layer, Mixer, Model, Tensor, Turn, Vocab};
 use detllm::sample::{Rng, SampleParams};
 use detllm::sha256::{hex, sha256};
 use detllm::tokenizer::Tokenizer;
@@ -88,6 +90,7 @@ fn llama_like() -> Model {
         prefix: vec![1],
         suffix: Vec::new(),
         stop: vec![1, 2],
+        chat: None,
     }
 }
 
@@ -195,14 +198,20 @@ fn qwen_like() -> Model {
         prefix: vec![T_START],
         suffix: vec![b(b'\n')],
         stop: vec![T_END],
+        chat: Some(Chat {
+            system: Turn { open: vec![T_START, b(b's'), b(b'\n')], close: vec![T_END, b(b'\n')] },
+            user: Turn { open: vec![T_START], close: vec![T_END, b(b'\n')] },
+            assistant: Turn { open: vec![T_START, b(b'a'), b(b'\n')], close: vec![T_END, b(b'\n')] },
+            generation: vec![T_START, b(b'a'), b(b'\n')],
+        }),
     }
 }
 
 #[test]
 fn file_format_roundtrip() {
     for (model, digest) in [
-        (llama_like(), "8e8d0f0debfaafd7db3aa37c85362a4ac133cac8c5e7ad5a645a686511508b77"),
-        (qwen_like(), "4ce64dc06c92c4ed0c2771f6611aa64112632391696f38b64c45bf23efa379c7"),
+        (llama_like(), "23a89b0ef078f14eeaa53f8413d779aa4c9d2087dc274962f7b3f7bc51517563"),
+        (qwen_like(), "9f69ebe2ffb95bdfb3b33ab4aab32103b39d64c1d9bbda46d9043a8e565847ad"),
     ] {
         let bytes = model.to_bytes().unwrap();
         assert_eq!(Model::from_bytes(&bytes).unwrap(), model);
@@ -554,5 +563,230 @@ fn corrupted_model_files_have_fixed_outcomes() {
         }
     }
     assert!(loaded > 100 && rejected > 100, "loaded {loaded}, rejected {rejected}");
-    assert_eq!(hex(&all.finalize()), "ebd6adda13fa98fc9109faf561460ca00e586d511f744b21efd5c01f81494a98");
+    assert_eq!(hex(&all.finalize()), "c8e8041d71add09dab60e3e1536edde8d2b0c53a7ba947b3f350501bb7d0ca29");
+}
+
+#[test]
+fn chat_template() {
+    let model = qwen_like();
+    let tok = Tokenizer::new(&model);
+    let chat = model.chat.clone().unwrap();
+    let b = |s: &str| s.bytes().map(u32::from).collect::<Vec<u32>>();
+    let conversation: [(Role, &[u8]); 4] =
+        [(Role::System, b" x "), (Role::User, b"the"), (Role::Assistant, b"and\n"), (Role::User, b"<|end|>")];
+    let want = [
+        &chat.system.open[..],
+        &b("x"),
+        &chat.system.close,
+        &chat.user.open,
+        &[T_THE],
+        &chat.user.close,
+        &chat.assistant.open,
+        &[T_AND],
+        &chat.assistant.close,
+        &chat.user.open,
+        // Message text never produces the special tokens of the template.
+        &b("<|end|>"),
+        &chat.user.close,
+        &chat.generation,
+    ]
+    .concat();
+    assert_eq!(chat_tokens(&model, &tok, &conversation).unwrap(), want);
+    assert!(chat_tokens(&model, &tok, &[(Role::User, b""), (Role::Assistant, b"x")]).is_err());
+    assert!(chat_tokens(&model, &tok, &[(Role::User, b"x"), (Role::System, b"x"), (Role::User, b"x")]).is_err());
+    assert!(chat_tokens(&model, &tok, &[]).is_err());
+    assert!(chat_tokens(&model, &tok, &[(Role::User, "the ".repeat(40).as_bytes())]).is_err());
+    let llama = llama_like();
+    assert!(chat_tokens(&llama, &Tokenizer::new(&llama), &[(Role::User, b"x")]).is_err());
+}
+
+/// A conversation continued from a kept, forked session gives the same tokens and
+/// logits as one run from scratch, and a fixed digest everywhere.
+#[test]
+fn resumed_sessions_match_fresh_ones() {
+    let model = Arc::new(qwen_like());
+    let tok = Tokenizer::new(&model);
+    let params = GenParams {
+        max_new_tokens: 6,
+        sample: SampleParams { temperature_q16: 52_429, top_k: 20, top_p_q16: 58_982, seed: 9 },
+        threads: 2,
+    };
+    let first = chat_tokens(&model, &tok, &[(Role::User, b"the and")]).unwrap();
+    let second = chat_tokens(
+        &model,
+        &tok,
+        &[(Role::User, b"the and"), (Role::Assistant, b"an the"), (Role::User, b"12 the")],
+    )
+    .unwrap();
+    let run = |session: &mut Session, prompt: &[u32]| {
+        let mut logits = Vec::new();
+        feed_prompt(session, prompt, true, |_, l| logits.extend_from_slice(l)).unwrap();
+        let mut tokens = prompt.to_vec();
+        sample_tokens(session, &mut tokens, &params, |s, _| {
+            logits.extend_from_slice(s.logits());
+            true
+        })
+        .unwrap();
+        (tokens, logits)
+    };
+    let fresh = run(&mut Session::new(Arc::clone(&model), 1), &second);
+
+    // Keep a session after the first user message, use the original for something
+    // else, and continue the fork with the second conversation.
+    let mut session = Session::new(Arc::clone(&model), 3);
+    let shared = first.len() - model.chat.as_ref().unwrap().generation.len();
+    feed_prompt(&mut session, &first[..shared], false, |_, _| {}).unwrap();
+    let mut kept = session.fork();
+    run(&mut session, &first);
+    let resumed = run(&mut kept, &second);
+    assert!(fresh.0.len() > second.len() + 2, "the reply should not stop at once");
+    assert_eq!(resumed, fresh);
+    assert!(feed_prompt(&mut kept, &second, true, |_, _| {}).is_err(), "a session ahead of its prompt");
+
+    let mut digest = detllm::sha256::Sha256::new();
+    digest.update_u32s(&fresh.0);
+    digest.update_i32s(&fresh.1);
+    assert_eq!(hex(&digest.finalize()), "1f80d18434719406d850b772f805509cfeeedd62680808c863fde28079c80cb3");
+}
+
+/// A server for the synthetic Qwen-like model on a free local port.
+#[cfg(not(any(miri, target_family = "wasm")))]
+fn start_server() -> std::net::SocketAddr {
+    use detllm::server::{serve, Config};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = Config {
+        model: Arc::new(qwen_like()),
+        model_id: [7; 32],
+        name: "test".into(),
+        threads: 2,
+        allow_origin: None,
+        log: false,
+    };
+    std::thread::spawn(move || serve(listener, config));
+    addr
+}
+
+/// Send a raw request; returns the status line, the headers and the body (with a
+/// chunked body decoded).
+#[cfg(not(any(miri, target_family = "wasm")))]
+fn http(addr: std::net::SocketAddr, request: &str) -> (String, String, String) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let raw = String::from_utf8(raw).unwrap();
+    let (head, mut body) = raw.split_once("\r\n\r\n").unwrap();
+    let (status, headers) = head.split_once("\r\n").unwrap_or((head, ""));
+    let mut decoded = String::new();
+    if headers.contains("Transfer-Encoding: chunked") {
+        loop {
+            let (size, rest) = body.split_once("\r\n").unwrap();
+            let size = usize::from_str_radix(size, 16).unwrap();
+            if size == 0 {
+                break;
+            }
+            decoded.push_str(&rest[..size]);
+            body = rest[size..].strip_prefix("\r\n").unwrap();
+        }
+    } else {
+        decoded.push_str(body);
+    }
+    (status.to_string(), headers.to_string(), decoded)
+}
+
+#[cfg(not(any(miri, target_family = "wasm")))]
+fn post(addr: std::net::SocketAddr, body: &str) -> (String, String, String) {
+    http(
+        addr,
+        &format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+}
+
+/// The `content` strings of a reply, in order: one for a completion, all deltas of a
+/// stream.
+#[cfg(not(any(miri, target_family = "wasm")))]
+fn contents(body: &str) -> Vec<String> {
+    let documents: Vec<&str> = match body.strip_prefix("data: ") {
+        Some(_) => body.split("\n\n").filter_map(|e| e.strip_prefix("data: ")).filter(|e| *e != "[DONE]").collect(),
+        None => vec![body],
+    };
+    let mut out = Vec::new();
+    for doc in documents {
+        let v = detllm::json::parse(doc.as_bytes()).unwrap();
+        let Some(detllm::json::Value::Array(choices)) = v.get("choices") else { panic!("{doc}") };
+        for choice in choices {
+            if let Some(text) = choice.get("message").or(choice.get("delta")).and_then(|m| m.get("content")) {
+                out.push(text.as_str().unwrap().to_string());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+#[cfg(not(any(miri, target_family = "wasm")))]
+fn server_replies_are_fixed() {
+    let addr = start_server();
+    let chat = r#"{"model":"test","messages":[{"role":"system","content":"x"},{"role":"user","content":"the and"}],"max_tokens":12,"temperature":0.8,"seed":5"#;
+    let (status, _, body) = post(addr, &format!("{chat}}}"));
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    assert_eq!(hex(&sha256(body.as_bytes())), "a5dbcfc2dbc5f96e246b08723dc94f2d48c6fa220e4bd8c7607aa1f84b7571f1");
+    // The same request again (now from a kept session) and from a fresh server.
+    assert_eq!(post(addr, &format!("{chat}}}")).2, body);
+    assert_eq!(post(start_server(), &format!("{chat}}}")).2, body);
+
+    // A stream carries the same text, split into pieces, over HTTP/1.1 and HTTP/1.0.
+    let reply = contents(&body).concat();
+    assert!(!reply.is_empty());
+    let streamed = format!("{chat},\"stream\":true,\"stream_options\":{{\"include_usage\":true}}}}");
+    let (status, headers, events) = post(addr, &streamed);
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert!(headers.contains("Content-Type: text/event-stream"));
+    assert!(events.ends_with("data: [DONE]\n\n") && events.contains("\"usage\":"));
+    assert!(contents(&events).len() > 2);
+    assert_eq!(contents(&events).concat(), reply);
+    let old = format!("POST /v1/chat/completions HTTP/1.0\r\nContent-Length: {}\r\n\r\n{streamed}", streamed.len());
+    assert_eq!(http(addr, &old).2, events);
+
+    // A stop string ends the reply before it, in both forms.
+    let cut = reply.char_indices().nth(4).map_or(reply.len(), |(i, _)| i);
+    let stop = &reply[cut..reply.len().min(cut + 3)];
+    let stopped = format!("{chat},\"stop\":[{}]}}", detllm::json::quote(stop));
+    let text = contents(&post(addr, &stopped).2).concat();
+    assert_eq!(text, &reply[..reply.find(stop).unwrap()]);
+    let stopped = format!("{chat},\"stop\":[{}],\"stream\":true}}", detllm::json::quote(stop));
+    assert_eq!(contents(&post(addr, &stopped).2).concat(), text);
+}
+
+#[test]
+#[cfg(not(any(miri, target_family = "wasm")))]
+fn server_handles_other_requests() {
+    let addr = start_server();
+    let get = |path: &str, extra: &str| http(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n{extra}\r\n"));
+    let (status, _, body) = get("/v1/models", "");
+    assert_eq!((status.as_str(), body.as_str()), ("HTTP/1.1 200 OK", r#"{"object":"list","data":[{"id":"test","object":"model","created":0,"owned_by":"detllm"}]}"#));
+    assert_eq!(get("/health", "").0, "HTTP/1.1 200 OK");
+    assert_eq!(get("/nope", "").0, "HTTP/1.1 404 Not Found");
+    assert_eq!(get("/v1/chat/completions", "").0, "HTTP/1.1 405 Method Not Allowed");
+    for bad in ["{", r#"{"messages":[]}"#, r#"{"messages":[{"role":"user","content":"x"}],"temperature":-1}"#] {
+        let (status, _, body) = post(addr, bad);
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        assert!(body.starts_with(r#"{"error":{"message":"#), "{body}");
+    }
+    // A conversation that does not fit in the context window is refused, not cut.
+    let long = format!(r#"{{"messages":[{{"role":"user","content":"{}"}}]}}"#, "the ".repeat(50));
+    assert_eq!(post(addr, &long).0, "HTTP/1.1 400 Bad Request");
+    assert_eq!(http(addr, "nonsense\r\n\r\n").0, "HTTP/1.1 400 Bad Request");
+
+    // Browser pages from this machine may call the server, other sites may not.
+    let local = get("/v1/models", "Origin: http://localhost:5173\r\n").1;
+    assert!(local.contains("Access-Control-Allow-Origin: http://localhost:5173"));
+    assert!(!get("/v1/models", "Origin: https://example.com\r\n").1.contains("Access-Control"));
+    let preflight = "OPTIONS /v1/chat/completions HTTP/1.1\r\nOrigin: http://127.0.0.1:3000\r\n\r\n";
+    assert_eq!(http(addr, preflight).0, "HTTP/1.1 204 No Content");
 }

@@ -1,4 +1,4 @@
-//! Model file format (`.dllm`, version 3). Integers are little-endian `u32`/`i32`
+//! Model file format (`.dllm`, version 4). Integers are little-endian `u32`/`i32`
 //! unless noted.
 //!
 //! ```text
@@ -24,6 +24,8 @@
 //! wcls          [vocab_size, dim]        only if shared_classifier = 0
 //! tokenizer     (see below)
 //! prefix, suffix, stop: each `u32 count` followed by that many token ids
+//! has_chat      u32; if 1, seven more token lists: system open, system close,
+//!               user open, user close, assistant open, assistant close, generation
 //! ```
 //!
 //! All tensors hold Q24 values unless noted, matrices row-major `[rows, cols]`.
@@ -45,13 +47,15 @@
 //!
 //! A prompt is run as `prefix ++ encode(text) ++ suffix`, where leading and trailing
 //! whitespace is removed from `text` first if `trim_prompt` is set; generation ends at
-//! any `stop` token. The identity of a model is the SHA-256 of its file.
+//! any `stop` token. A conversation is run as `open ++ encode(content) ++ close` for
+//! every message with the lists of its role, followed by `generation`; the content is
+//! trimmed in the same way. The identity of a model is the SHA-256 of its file.
 
 use crate::{err, Error, Result};
 use std::io::Read;
 
 pub const MAGIC: [u8; 4] = *b"DLLM";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// A matrix of Q24 values in one of the two encodings of the file format.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +165,30 @@ pub enum Vocab {
     Bpe { special: Vec<bool>, merges: Vec<[u32; 3]>, byte_tokens: Vec<u32>, classes: Vec<[u32; 3]> },
 }
 
+/// The tokens around one message of a conversation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Turn {
+    pub open: Vec<u32>,
+    pub close: Vec<u32>,
+}
+
+/// Chat template: a conversation is `open ++ encode(content) ++ close` for every
+/// message, followed by `generation`, after which the model writes the reply.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Chat {
+    pub system: Turn,
+    pub user: Turn,
+    pub assistant: Turn,
+    pub generation: Vec<u32>,
+}
+
+impl Chat {
+    fn lists(&self) -> [&Vec<u32>; 7] {
+        let Chat { system, user, assistant, generation } = self;
+        [&system.open, &system.close, &user.open, &user.close, &assistant.open, &assistant.close, generation]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Model {
     pub dim: usize,
@@ -194,6 +222,8 @@ pub struct Model {
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,
     pub stop: Vec<u32>,
+    /// `None` if the model cannot hold conversations.
+    pub chat: Option<Chat>,
 }
 
 struct Reader<R: Read> {
@@ -464,7 +494,8 @@ impl Model {
                 }
             }
         }
-        if self.prefix.iter().chain(&self.suffix).chain(&self.stop).any(|&id| id as usize >= v) {
+        let chat = self.chat.iter().flat_map(Chat::lists).flatten();
+        if self.prefix.iter().chain(&self.suffix).chain(&self.stop).chain(chat).any(|&id| id as usize >= v) {
             return err("prompt template refers to a token outside the vocabulary");
         }
         Ok(())
@@ -514,6 +545,7 @@ impl Model {
             prefix: Vec::new(),
             suffix: Vec::new(),
             stop: Vec::new(),
+            chat: None,
         };
         let n_layers = r.u32()? as usize;
         m.vocab_size = r.u32()? as usize;
@@ -636,6 +668,15 @@ impl Model {
         m.prefix = r.ids(1 << 16)?;
         m.suffix = r.ids(1 << 16)?;
         m.stop = r.ids(1 << 16)?;
+        if r.flag("has_chat")? {
+            let mut list = || r.ids(1 << 16);
+            m.chat = Some(Chat {
+                system: Turn { open: list()?, close: list()? },
+                user: Turn { open: list()?, close: list()? },
+                assistant: Turn { open: list()?, close: list()? },
+                generation: list()?,
+            });
+        }
         let mut probe = [0u8; 1];
         match r.inner.read(&mut probe) {
             Ok(0) => {}
@@ -746,6 +787,10 @@ impl Model {
         put_ids(&mut out, &self.prefix);
         put_ids(&mut out, &self.suffix);
         put_ids(&mut out, &self.stop);
+        put_u32(&mut out, self.chat.is_some() as u32);
+        for list in self.chat.iter().flat_map(Chat::lists) {
+            put_ids(&mut out, list);
+        }
         Ok(out)
     }
 }

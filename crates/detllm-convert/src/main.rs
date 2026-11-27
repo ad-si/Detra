@@ -265,6 +265,7 @@ fn convert(ckpt_path: &str, tokenizer_path: &str, out_path: &str) -> Result<(), 
         prefix: vec![BOS_ID],
         suffix: Vec::new(),
         stop: vec![BOS_ID, EOS_ID],
+        chat: None,
     };
     let bytes = model.to_bytes().map_err(|e| e.to_string())?;
     std::fs::write(out_path, &bytes).map_err(|e| format!("{out_path}: {e}"))?;

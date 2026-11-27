@@ -40,7 +40,7 @@ test: ## Run unit tests and the synthetic-model determinism tests (debug and rel
 .PHONY: lint
 lint: ## Clippy, plus a check that the engine crate contains no floating point
 	cargo clippy --locked --all-targets -- -D warnings
-	scripts/no-float.sh
+	uv run --no-project scripts/no-float.py crates/detllm
 
 models/stories15M.bin:
 	curl -L --fail -o $@ $(STORIES_URL)
@@ -121,12 +121,17 @@ verify-docker-qwen: models ## Qwen3.5 on emulated big-endian s390x Linux (needs 
 check-qwen: models ## Compare Qwen3.5 on the integer engine with the Hugging Face float implementation
 	uv run tools/check_qwen35.py $(QWEN_DIR) $(QWEN)
 
+.PHONY: serve
+serve: build $(QWEN) ## Serve Qwen3.5 as an OpenAI-compatible chat API on http://127.0.0.1:8080/v1
+	target/release/detllm serve --model $(QWEN)
+
 .PHONY: install
 install: build $(QWEN) ## Install the `detllm` CLI (cargo bin dir) and Qwen3.5-0.8B ($XDG_DATA_HOME/detllm)
 	cargo install --locked --path crates/detllm
 	mkdir -p "$(DATA_DIR)"
 	cp $(QWEN) "$(DATA_DIR)/model.dllm"
 	@echo 'Installed. Try: detllm generate "Why is the sky blue?" --max-tokens 100'
+	@echo 'or point a chat front end at `detllm serve` (http://127.0.0.1:8080/v1).'
 
 .PHONY: uninstall
 uninstall: ## Remove the installed CLI and model

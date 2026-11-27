@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["numpy", "tokenizers"]
 # ///
-"""Convert a Hugging Face Qwen3.5 text model to the integer-only DLLM format (version 3).
+"""Convert a Hugging Face Qwen3.5 text model to the integer-only DLLM format (version 4).
 
 Usage: uv run tools/convert_qwen35.py <model-dir> <out.dllm> [--seq-len N]
 
@@ -27,6 +27,14 @@ from tokenizers import Tokenizer
 PREFIX = "<|im_start|>user\n"
 SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 STOP = ["<|im_end|>", "<|endoftext|>"]
+# Chat template (chat_template.jinja without tools and thinking): per role the text
+# before and after the message content, then the generation prompt.
+CHAT = [
+    ("<|im_start|>system\n", "<|im_end|>\n"),
+    ("<|im_start|>user\n", "<|im_end|>\n"),
+    ("<|im_start|>assistant\n", "<|im_end|>\n"),
+]
+GENERATION = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
 # Unicode White_Space, which is what `\s` means in the tokenizer's regex.
 WHITE_SPACE = [*range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x2000, 0x200B),
                0x2028, 0x2029, 0x202F, 0x205F, 0x3000]
@@ -177,7 +185,7 @@ def main():
     st = SafeTensors(src / "model.safetensors")
     w = Writer(out_path)
     w.raw(b"DLLM")
-    w.u32(3, dim, hidden, n_layers, vocab_size, seq_len, round(cfg["rms_norm_eps"] * 2**32),
+    w.u32(4, dim, hidden, n_layers, vocab_size, seq_len, round(cfg["rms_norm_eps"] * 2**32),
           n_heads, n_kv, head_dim, rotary_dim, 1, 1, int(cfg["attn_output_gate"]),
           lin_heads, kd, vd, kernel, 1, 1, 0, 1)
     w.u32(*layer_types)
@@ -246,6 +254,9 @@ def main():
     w.ids(hf.encode(PREFIX, add_special_tokens=False).ids)
     w.ids(hf.encode(SUFFIX, add_special_tokens=False).ids)
     w.ids([hf.token_to_id(t) for t in STOP])
+    w.u32(1)
+    for text in [*(t for turn in CHAT for t in turn), GENERATION]:
+        w.ids(hf.encode(text, add_special_tokens=False).ids)
     w.f.close()
     print(f"{w.sha.hexdigest()}  {out_path}")
 

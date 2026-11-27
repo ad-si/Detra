@@ -90,6 +90,8 @@ detllm generate <prompt> [--max-tokens N] [--temperature T] [--top-k K]
 detllm generate --prompt-file <path> [...]
 detllm info [--model model.dllm]
 detllm digest <prompts.txt> [--max-tokens N] [--model model.dllm]
+detllm trace <prompt> | --messages <chat.json> [--max-tokens N] [--logits out.bin]
+detllm serve [--port N] [--host H] [--allow-origin URL] [--model model.dllm]
 ```
 
 Without `--model`, `$DETLLM_MODEL` is used,
@@ -100,6 +102,46 @@ The text is printed as it is generated.
 The prompt is used byte for byte; `--prompt-file` reads it from a file
 (every byte counts, including a final newline).
 Put `--` before a prompt that starts with dashes.
+
+
+## Chat Server
+
+```sh
+detllm serve                # http://127.0.0.1:8080/v1
+```
+
+`detllm serve [--port N] [--host H] [--allow-origin URL] [--model model.dllm]`
+serves an OpenAI-compatible API, so any chat front end
+that talks to OpenAI-compatible servers can use it
+(e.g. Open WebUI, LibreChat, Chatbox, Jan, or the `openai` client libraries).
+Set the base URL to `http://127.0.0.1:8080/v1`, any API key, and model `detllm`.
+
+- `POST /v1/chat/completions`: system, user and assistant messages,
+  `stream` (server-sent events, with `stream_options.include_usage`),
+  `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`,
+  `seed`, `stop`. Unknown fields are ignored.
+- `GET /v1/models`, `GET /health`.
+
+Not supported: tools, images, multiple choices (`n` > 1), logprobs, thinking mode.
+Message text is always plain text:
+it never turns into the control tokens that structure the conversation,
+so a message cannot fake another turn.
+A conversation longer than the context window is refused, not shortened.
+
+The reply is a function of the model file and the request body only,
+and the response contains no timestamps or random ids.
+The same conversation with the same settings gives the same reply, byte for byte.
+Defaults are greedy decoding and seed 0.
+Sampling at any temperature uses the request's seed (0 if it sends none),
+so it is reproducible too: "regenerate" in a front end gives the same answer again
+unless the front end sends a different seed.
+
+The server runs one generation at a time and keeps snapshots of recent sessions,
+so continuing a conversation only computes the new messages.
+It listens on localhost only by default.
+Browser pages served from localhost may call it;
+`--allow-origin` allows another origin (or `*` for any).
+There is no authentication, so do not expose it to a network you do not trust.
 
 
 ## Verification
@@ -123,7 +165,8 @@ The `verify` targets compare that output with the files in `golden/`:
 `make test` runs the test-suite natively in debug and release builds;
 the x86-64, WASM, Miri, and `verify-docker` targets also run it on their architecture.
 `make check-qwen` compares the integer engine
-with the Hugging Face float implementation of Qwen3.5.
+with the Hugging Face float implementation of Qwen3.5,
+including the chat template for multi-turn conversations.
 `make setup` installs the required Rust targets and components.
 Run `make help` for all targets.
 

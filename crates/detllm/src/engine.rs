@@ -103,6 +103,7 @@ fn add_to(x: &mut [i64], update: &[i64]) {
     }
 }
 
+#[derive(Clone)]
 enum LayerState {
     /// Rotated keys and values of every past position, `kv_rows` each.
     Attention { keys: Arc<Vec<i32>>, vals: Arc<Vec<i32>> },
@@ -239,7 +240,9 @@ fn attention_head(
 
 pub struct Session {
     model: Arc<Model>,
-    pool: Pool,
+    /// Created on first use, so that sessions kept for later hold no threads.
+    pool: Option<Pool>,
+    threads: usize,
     pos: usize,
     /// `isqrt(head_dim * 2^32)`: sqrt(head_dim) in Q16.
     sqrt_head_q16: i64,
@@ -267,7 +270,8 @@ impl Session {
             })
             .collect();
         Session {
-            pool: Pool::new(threads),
+            pool: None,
+            threads,
             pos: 0,
             sqrt_head_q16: isqrt_u128((model.head_dim as u128) << 32) as i64,
             states,
@@ -277,6 +281,30 @@ impl Session {
         }
     }
 
+    fn pool(&self) -> &Pool {
+        self.pool.as_ref().expect("the pool is created before the first forward pass")
+    }
+
+    /// An independent copy of this session: both continue from
+    /// the same position and give the same results as one session fed the same tokens.
+    pub fn fork(&self) -> Session {
+        Session {
+            model: Arc::clone(&self.model),
+            pool: None,
+            threads: self.threads,
+            pos: self.pos,
+            sqrt_head_q16: self.sqrt_head_q16,
+            states: self.states.clone(),
+            hidden: self.hidden.clone(),
+            logits: self.logits.clone(),
+        }
+    }
+
+    pub fn model(&self) -> &Arc<Model> {
+        &self.model
+    }
+
+    /// Number of tokens fed so far.
     pub fn pos(&self) -> usize {
         self.pos
     }
@@ -314,6 +342,8 @@ impl Session {
         if count == 0 {
             return Ok(&self.logits);
         }
+        let threads = self.threads;
+        self.pool.get_or_insert_with(|| Pool::new(threads));
         let d = m.dim;
         let mut x = vec![0i64; count * d];
         for (xs, &token) in x.chunks_exact_mut(d).zip(tokens) {
@@ -332,16 +362,16 @@ impl Session {
 
             let xn = self.norm(&x, &layer.norm2, count);
             let hidden =
-                self.pool.matmul_pair(&m, (Weight::Gate(l), Weight::Up(l)), &xn, count, TO_ACT, mlp_hidden);
+                self.pool().matmul_pair(&m, (Weight::Gate(l), Weight::Up(l)), &xn, count, TO_ACT, mlp_hidden);
             let hidden = Arc::new(hidden.into_iter().map(|v| v as i32).collect());
-            let down = self.pool.matmul(&m, Weight::Down(l), &hidden, count, TO_RESIDUAL);
+            let down = self.pool().matmul(&m, Weight::Down(l), &hidden, count, TO_RESIDUAL);
             add_to(&mut x, &down);
         }
 
         self.hidden = self.norm(&x, &m.final_norm, count).to_vec();
         if want_logits {
             let last = Arc::new(self.hidden[(count - 1) * d..].to_vec());
-            let logits = self.pool.matmul(&m, Weight::Classifier, &last, 1, TO_ACT);
+            let logits = self.pool().matmul(&m, Weight::Classifier, &last, 1, TO_ACT);
             self.logits = logits.into_iter().map(saturate).collect();
         }
         self.pos += count;
@@ -356,7 +386,7 @@ impl Session {
         }
         let (x, w, eps) = (Arc::new(x.to_vec()), Arc::new(w.to_vec()), self.model.rms_eps_q32);
         let dim = w.len();
-        let values = self.pool.map(count, true, true, move |t, out| {
+        let values = self.pool().map(count, true, true, move |t, out| {
             let mut normed = vec![0i32; dim];
             rmsnorm_residual(&mut normed, &x[t * dim..(t + 1) * dim], &w, eps);
             out.extend(normed.iter().map(|&v| v as i64));
@@ -373,9 +403,9 @@ impl Session {
         let (q_rows, kv_rows, att_out) = (m.q_rows(), m.kv_rows(), m.att_out());
 
         // Per head, wq yields `head_dim` query values followed by the gate values.
-        let mut q: Vec<i32> = self.pool.matmul(&m, Weight::Wq(l), xn, count, TO_ACT).into_iter().map(saturate).collect();
-        let mut k: Vec<i32> = self.pool.matmul(&m, Weight::Wk(l), xn, count, TO_ACT).into_iter().map(saturate).collect();
-        let v = activations(self.pool.matmul(&m, Weight::Wv(l), xn, count, TO_ACT));
+        let mut q: Vec<i32> = self.pool().matmul(&m, Weight::Wq(l), xn, count, TO_ACT).into_iter().map(saturate).collect();
+        let mut k: Vec<i32> = self.pool().matmul(&m, Weight::Wk(l), xn, count, TO_ACT).into_iter().map(saturate).collect();
+        let v = activations(self.pool().matmul(&m, Weight::Wv(l), xn, count, TO_ACT));
         for t in 0..count {
             let pos = self.pos + t;
             let cos = &m.rope_cos[pos * half..(pos + 1) * half];
@@ -405,7 +435,7 @@ impl Session {
         let (n_heads, first_pos, sqrt_head_q16) = (m.n_heads, self.pos, self.sqrt_head_q16);
         let (q, keys, vals, model) = (Arc::new(q), Arc::clone(keys), Arc::clone(vals), Arc::clone(&m));
         let parallel = count * n_heads * (first_pos + count) * hd >= 1 << 16;
-        let out = self.pool.map(count * n_heads, parallel, true, move |block, out| {
+        let out = self.pool().map(count * n_heads, parallel, true, move |block, out| {
             let (t, h) = (block / n_heads, block % n_heads);
             let head = &q[t * q_rows + h * q_stride..t * q_rows + (h + 1) * q_stride];
             let kv = (h / group) * hd;
@@ -413,7 +443,7 @@ impl Session {
         });
         debug_assert_eq!(out.len(), count * att_out);
         let out = Arc::new(out.into_iter().map(|v| v as i32).collect());
-        self.pool.matmul(&m, Weight::Wo(l), &out, count, TO_RESIDUAL)
+        self.pool().matmul(&m, Weight::Wo(l), &out, count, TO_RESIDUAL)
     }
 
     /// Gated delta layer for `count` new positions. Returns the update of the residual.
@@ -422,11 +452,12 @@ impl Session {
         let (heads, vd) = (m.lin_heads, m.lin_v_dim);
         let (conv_dim, kernel, value_dim) = (m.conv_dim(), m.conv_kernel, m.lin_v());
 
-        let mixed = activations(self.pool.matmul(&m, Weight::Qkv(l), xn, count, TO_ACT));
-        let z = activations(self.pool.matmul(&m, Weight::Z(l), xn, count, TO_ACT));
-        let b = Arc::new(self.pool.matmul(&m, Weight::B(l), xn, count, TO_GATE));
-        let a = Arc::new(self.pool.matmul(&m, Weight::A(l), xn, count, TO_GATE));
+        let mixed = activations(self.pool().matmul(&m, Weight::Qkv(l), xn, count, TO_ACT));
+        let z = activations(self.pool().matmul(&m, Weight::Z(l), xn, count, TO_ACT));
+        let b = Arc::new(self.pool().matmul(&m, Weight::B(l), xn, count, TO_GATE));
+        let a = Arc::new(self.pool().matmul(&m, Weight::A(l), xn, count, TO_GATE));
 
+        let pool = self.pool.as_ref().expect("the pool is created before the first forward pass");
         let LayerState::Delta { conv, memory } = &mut self.states[l] else {
             unreachable!("layer state does not match the layer type");
         };
@@ -438,7 +469,7 @@ impl Session {
         *conv = history[count * conv_dim..].to_vec();
         const CHANNELS: usize = 128;
         let (history, model) = (Arc::new(history), Arc::clone(&m));
-        let by_channel = self.pool.map(conv_dim.div_ceil(CHANNELS), true, true, move |block, out| {
+        let by_channel = pool.map(conv_dim.div_ceil(CHANNELS), true, true, move |block, out| {
             let Mixer::Delta(g) = &model.layers[l].mixer else {
                 unreachable!("layer {l} is not a gated delta layer");
             };
@@ -465,7 +496,7 @@ impl Session {
         // makes it a pure function; the first finished copy of each head is kept.
         let updated: Arc<Vec<Mutex<Option<Vec<i64>>>>> = Arc::new((0..heads).map(|_| Mutex::new(None)).collect());
         let (qkv, old, new, model) = (Arc::new(qkv), memory.clone(), Arc::clone(&updated), Arc::clone(&m));
-        let by_head = self.pool.map(heads, true, true, move |h, out| {
+        let by_head = pool.map(heads, true, true, move |h, out| {
             let Mixer::Delta(g) = &model.layers[l].mixer else {
                 unreachable!("layer {l} is not a gated delta layer");
             };
@@ -485,6 +516,6 @@ impl Session {
                 }
             }
         }
-        self.pool.matmul(&m, Weight::Out(l), &Arc::new(out), count, TO_RESIDUAL)
+        self.pool().matmul(&m, Weight::Out(l), &Arc::new(out), count, TO_RESIDUAL)
     }
 }

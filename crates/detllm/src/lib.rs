@@ -11,12 +11,15 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
+pub mod chat;
 pub mod engine;
 pub mod fixed;
 pub mod generate;
+pub mod json;
 pub mod model;
 pub mod pool;
 pub mod sample;
+pub mod server;
 pub mod sha256;
 pub mod tokenizer;
 

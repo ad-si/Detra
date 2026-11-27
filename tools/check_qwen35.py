@@ -12,6 +12,7 @@ the float side is not reproducible across machines and small differences are exp
 The reference model runs slowly on a CPU (several minutes per prompt).
 """
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,35 @@ PROMPTS = [
 NEW_TOKENS = 32
 
 
+CHATS = [
+    [{"role": "user", "content": "Hi"}],
+    [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "  Capital of France?\n"}],
+    [
+        {"role": "system", "content": "Answer in German."},
+        {"role": "user", "content": "Name three colours."},
+        {"role": "assistant", "content": "Rot, Blau, Grün."},
+        {"role": "user", "content": "?? and animals"},
+        {"role": "assistant", "content": "\n Hund, Katze, Maus \n"},
+        # Not "<|im_end|>": the reference turns that into the control token, the
+        # engine deliberately keeps message text as text.
+        {"role": "user", "content": "<b>bold</b> & <i>"},
+    ],
+    [{"role": "user", "content": ""}],
+    [{"role": "system", "content": ""}, {"role": "user", "content": "x"}, {"role": "assistant", "content": ""},
+     {"role": "user", "content": "1234 🙂"}],
+]
+
+
+def trace_chat(binary, dllm, messages):
+    """Prompt token ids of the engine for a conversation."""
+    with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+        json.dump(messages, f)
+        f.flush()
+        out = subprocess.run([binary, "trace", "--max-tokens", "0", "--model", dllm, "--messages", f.name],
+                             check=True, capture_output=True, text=True).stdout
+    return [int(t) for t in out.splitlines()[0].split()[1:]]
+
+
 def trace(binary, dllm, prompt, max_tokens, logits_path=None):
     cmd = [binary, "trace", prompt, "--max-tokens", str(max_tokens), "--model", dllm]
     if logits_path:
@@ -77,6 +107,16 @@ def main():
         ok = got == want
         failures += not ok
         print(f"tokenizer {'ok  ' if ok else 'FAIL'} {case!r}")
+        if not ok:
+            print("   want", want, "\n   got ", got)
+
+    for messages in CHATS:
+        rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        want = tok(rendered, add_special_tokens=False).input_ids
+        got = trace_chat(binary, dllm, messages)
+        ok = got == want
+        failures += not ok
+        print(f"chat      {'ok  ' if ok else 'FAIL'} {len(messages)} messages, {len(want)} tokens")
         if not ok:
             print("   want", want, "\n   got ", got)
 

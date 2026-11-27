@@ -50,11 +50,15 @@ pub struct Config {
     pub allow_origin: Option<String>,
     /// Write one line per request to standard error.
     pub log: bool,
+    /// Append every chat request and its reply here, as one JSON object per line.
+    pub record: Option<Box<dyn Write + Send + Sync>>,
 }
 
 /// Serve requests on `listener` forever.
-pub fn serve(listener: TcpListener, config: Config) {
+pub fn serve(listener: TcpListener, mut config: Config) {
+    let record = config.record.take().map(Mutex::new);
     let server = Server {
+        record,
         tokenizer: Tokenizer::new(&config.model),
         config: &config,
         kept: Mutex::new(Vec::new()),
@@ -82,6 +86,7 @@ struct Server<'a> {
     tokenizer: Tokenizer<'a>,
     /// Sessions with the tokens they have consumed, least recently used first.
     kept: Mutex<Vec<(Vec<u32>, Session)>>,
+    record: Option<Mutex<Box<dyn Write + Send + Sync>>>,
     /// Held while generating: the engine already uses every core it was given.
     busy: Mutex<()>,
     connections: AtomicUsize,
@@ -435,6 +440,8 @@ fn parse_chat(body: &[u8]) -> Result<ChatRequest, Failure> {
 struct Summary {
     status: u16,
     note: String,
+    /// For a chat request: the members describing the reply in the record.
+    reply: Option<String>,
 }
 
 impl Server<'_> {
@@ -454,11 +461,34 @@ impl Server<'_> {
             Ok(summary) => summary,
             Err((status, message)) => {
                 let _ = self.respond(&mut stream, status, &cors, "application/json", &error_body(&message));
-                Summary { status, note: message }
+                let reply = format!("\"error\":{{\"status\":{status},\"message\":{}}}", quote(&message));
+                Summary { status, note: message, reply: Some(reply) }
             }
         };
         if self.config.log {
             eprintln!("{} {} {} {}", request.method, request.path, summary.status, summary.note);
+        }
+        if request.method == "POST" && request.path == "/v1/chat/completions" {
+            if let (Some(record), Some(reply)) = (&self.record, &summary.reply) {
+                self.record(record, &request, reply);
+            }
+        }
+    }
+
+    /// Append one line: the time, the model, the request as received and the reply.
+    fn record(&self, record: &Mutex<Box<dyn Write + Send + Sync>>, request: &Request, reply: &str) {
+        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let body = match json::parse(&request.body) {
+            Ok(value) => value.to_json(),
+            Err(_) => quote(&String::from_utf8_lossy(&request.body)),
+        };
+        let line = format!(
+            "{{\"time\":{time},\"model\":\"{}\",\"request\":{body},{reply}}}\n",
+            hex(&self.config.model_id)
+        );
+        let mut file = record.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = file.write_all(line.as_bytes()).and_then(|()| file.flush()) {
+            eprintln!("error: cannot record the request: {e}");
         }
     }
 
@@ -503,7 +533,7 @@ impl Server<'_> {
         let json = "application/json";
         let mut reply = |status: u16, body: &str| {
             let _ = self.respond(stream, status, cors, json, body);
-            Ok(Summary { status, note: String::new() })
+            Ok(Summary { status, note: String::new(), reply: None })
         };
         match (request.method.as_str(), request.path.as_str()) {
             ("OPTIONS", _) => reply(204, ""),
@@ -632,7 +662,9 @@ impl Server<'_> {
         .map_err(internal)?;
         let text = match stopped {
             Some(text) => text,
-            None => text_prefix(&self.tokenizer.decode(&tokens[prompt_len..]), true),
+            // A reply cut off by a limit may end inside a character; that character
+            // is left out rather than shown as invalid.
+            None => text_prefix(&self.tokenizer.decode(&tokens[prompt_len..]), finish == Finish::Stop),
         };
         let completion = tokens.len() - prompt_len;
         self.keep(&tokens, session);
@@ -663,9 +695,15 @@ impl Server<'_> {
             let _ = self.respond(out.stream, 200, cors, "application/json", &body);
         }
         let gone = if out.failed { ", client disconnected" } else { "" };
+        let reply = format!(
+            "\"id\":\"{id}\",\"reply\":{},\"finish_reason\":{finish_reason},{usage},\"client_disconnected\":{}",
+            quote(&text),
+            out.failed
+        );
         Ok(Summary {
             status: 200,
             note: format!("prompt {prompt_len} tokens ({reused} reused), completion {completion} tokens{gone}"),
+            reply: Some(reply),
         })
     }
 }

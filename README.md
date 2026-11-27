@@ -110,7 +110,7 @@ Put `--` before a prompt that starts with dashes.
 detllm serve                # http://127.0.0.1:8080/v1
 ```
 
-`detllm serve [--port N] [--host H] [--allow-origin URL] [--model model.dllm]`
+`detllm serve [--port N] [--host H] [--allow-origin URL] [--record log.jsonl] [--model model.dllm]`
 serves an OpenAI-compatible API, so any chat front end
 that talks to OpenAI-compatible servers can use it
 (e.g. Open WebUI, LibreChat, Chatbox, Jan, or the `openai` client libraries).
@@ -135,6 +135,14 @@ Defaults are greedy decoding and seed 0.
 Sampling at any temperature uses the request's seed (0 if it sends none),
 so it is reproducible too: "regenerate" in a front end gives the same answer again
 unless the front end sends a different seed.
+
+`--record log.jsonl` appends every chat request to the file as one JSON line:
+the time, the model's SHA-256, the request as received, and the reply
+(`id`, `reply`, `finish_reason`, `usage`, `client_disconnected`),
+or the error for a rejected request.
+A new file is readable by its owner only.
+Since replies are deterministic, any recorded request can be sent again
+to reproduce its reply with the same model.
 
 The server runs one generation at a time and keeps snapshots of recent sessions,
 so continuing a conversation only computes the new messages.

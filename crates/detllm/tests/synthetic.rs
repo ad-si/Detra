@@ -652,6 +652,28 @@ fn resumed_sessions_match_fresh_ones() {
 /// A server for the synthetic Qwen-like model on a free local port.
 #[cfg(not(any(miri, target_family = "wasm")))]
 fn start_server() -> std::net::SocketAddr {
+    start_recording_server(None)
+}
+
+/// A writer that collects everything written to it.
+#[cfg(not(any(miri, target_family = "wasm")))]
+#[derive(Clone, Default)]
+struct Collected(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(not(any(miri, target_family = "wasm")))]
+impl std::io::Write for Collected {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(miri, target_family = "wasm")))]
+fn start_recording_server(record: Option<Collected>) -> std::net::SocketAddr {
     use detllm::server::{serve, Config};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -662,6 +684,7 @@ fn start_server() -> std::net::SocketAddr {
         threads: 2,
         allow_origin: None,
         log: false,
+        record: record.map(|r| Box::new(r) as Box<dyn std::io::Write + Send + Sync>),
     };
     std::thread::spawn(move || serve(listener, config));
     addr
@@ -789,4 +812,37 @@ fn server_handles_other_requests() {
     assert!(!get("/v1/models", "Origin: https://example.com\r\n").1.contains("Access-Control"));
     let preflight = "OPTIONS /v1/chat/completions HTTP/1.1\r\nOrigin: http://127.0.0.1:3000\r\n\r\n";
     assert_eq!(http(addr, preflight).0, "HTTP/1.1 204 No Content");
+}
+
+#[test]
+#[cfg(not(any(miri, target_family = "wasm")))]
+fn server_records_interactions() {
+    use detllm::json::{parse, Value};
+    let record = Collected::default();
+    let addr = start_recording_server(Some(record.clone()));
+    let chat = "{\"messages\": [{\"role\":\"user\",\n \"content\":\"the\\nand\"}], \"max_tokens\": 5, \"seed\": 2.0e0}";
+    assert_eq!(post(addr, chat).0, "HTTP/1.1 400 Bad Request");
+    let chat = "{\"messages\": [{\"role\":\"user\",\n \"content\":\"the\\nand\"}], \"max_tokens\": 5}";
+    let (_, _, body) = post(addr, chat);
+    let streamed = chat.replace("5}", "5, \"stream\": true}");
+    post(addr, &streamed);
+    http(addr, "GET /v1/models HTTP/1.1\r\n\r\n");
+    post(addr, "not json");
+
+    let text = String::from_utf8(record.0.lock().unwrap().clone()).unwrap();
+    let lines: Vec<Value> = text.lines().map(|l| parse(l.as_bytes()).unwrap()).collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    let field = |i: usize, name: &str| lines[i].get(name).cloned();
+    let s = |v: &str| Some(Value::String(v.into()));
+    assert_eq!(field(0, "model"), s(&hex(&[7; 32])));
+    assert!(matches!(field(0, "time"), Some(Value::Number(_))));
+    assert_eq!(field(0, "error").and_then(|e| e.get("status").cloned()), Some(Value::Number("400".into())));
+    // The request is kept as sent, only without the whitespace between values.
+    assert_eq!(field(1, "request"), Some(parse(chat.as_bytes()).unwrap()));
+    assert_eq!(field(1, "reply"), s(&contents(&body).concat()));
+    assert_eq!(field(2, "reply"), field(1, "reply"));
+    assert_eq!(field(2, "id"), field(1, "id"));
+    assert_eq!(field(1, "client_disconnected"), Some(Value::Bool(false)));
+    assert!(field(1, "usage").and_then(|u| u.get("completion_tokens").cloned()).is_some());
+    assert_eq!(field(3, "request"), s("not json"));
 }

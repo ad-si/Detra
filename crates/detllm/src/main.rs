@@ -24,7 +24,8 @@ Usage:
   detllm digest <prompts.txt> [--max-tokens N] [--model model.dllm]
   detllm trace <prompt> [--max-tokens N] [--logits out.bin] [--model model.dllm]
   detllm trace --messages <chat.json> [...]
-  detllm serve [--port 8080] [--host 127.0.0.1] [--allow-origin URL] [--model model.dllm]
+  detllm serve [--port 8080] [--host 127.0.0.1] [--allow-origin URL] [--record log.jsonl]
+               [--model model.dllm]
 
 Without --model, $DETLLM_MODEL is used, or else
 $XDG_DATA_HOME/detllm/model.dllm (default ~/.local/share/detllm/model.dllm).
@@ -40,7 +41,8 @@ serve:    OpenAI-compatible HTTP API for chat front ends: POST /v1/chat/completi
           (streaming supported), GET /v1/models. Listens on 127.0.0.1:8080 by default.
           Browser pages from localhost may call it; --allow-origin adds another
           origin, or `*` for any. Defaults are greedy decoding and seed 0, so a
-          request gives the same reply every time.
+          request gives the same reply every time. --record appends every chat
+          request and its reply to a file, one JSON object per line.
 trace:    prints the token ids of the prompt and of the greedy continuation, and
           optionally writes the first predicted logits as little-endian i32 (Q20).
           --messages takes a conversation instead, as a JSON list of
@@ -70,6 +72,7 @@ struct Options {
     host: Option<String>,
     port: Option<u16>,
     allow_origin: Option<String>,
+    record: Option<String>,
 }
 
 /// Options are `--name value`. Everything after a bare `--` is positional, so a prompt
@@ -87,6 +90,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, String> {
         host: None,
         port: None,
         allow_origin: None,
+        record: None,
     };
     let mut it = args.iter();
     let mut options_ended = false;
@@ -122,6 +126,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, String> {
             "--host" => o.host = Some(value.to_string()),
             "--port" => o.port = Some(value.parse().map_err(|_| bad())?),
             "--allow-origin" => o.allow_origin = Some(value.to_string()),
+            "--record" => o.record = Some(value.to_string()),
             _ => return Err(format!("unknown option {name}")),
         }
     }
@@ -177,6 +182,15 @@ fn performance_cores() -> Option<usize> {
     }
     let out = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.perflevel0.physicalcpu"]).output().ok()?;
     String::from_utf8(out.stdout).ok()?.trim().parse().ok().filter(|&n| n > 0)
+}
+
+/// Open a file for appending, readable by its owner only if it is new.
+fn open_record(path: &str) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 /// Passes bytes through while hashing them.
@@ -352,9 +366,17 @@ fn run(args: &[OsString]) -> Result<(), String> {
             }
             let addr = format!("{}:{}", o.host.as_deref().unwrap_or("127.0.0.1"), o.port.unwrap_or(8080));
             let listener = std::net::TcpListener::bind(&addr).map_err(|e| format!("{addr}: {e}"))?;
+            let record = match &o.record {
+                Some(path) => {
+                    eprintln!("Recording requests and replies in {path}");
+                    Some(Box::new(open_record(path).map_err(|e| format!("{path}: {e}"))?) as Box<dyn Write + Send + Sync>)
+                }
+                None => None,
+            };
             let name = "detllm".to_string();
             eprintln!("Serving model `{name}` (sha256 {}) at http://{addr}/v1", &hex(&id)[..16]);
-            serve(listener, Config { model: m, model_id: id, name, threads, allow_origin: o.allow_origin, log: true });
+            let allow_origin = o.allow_origin;
+            serve(listener, Config { model: m, model_id: id, name, threads, allow_origin, log: true, record });
             Ok(())
         }
         _ => Err(USAGE.into()),

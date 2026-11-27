@@ -28,6 +28,44 @@ impl Value {
         }
     }
 
+    /// The value as compact JSON on one line. Numbers are written as they were read.
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.write(&mut out);
+        out
+    }
+
+    fn write(&self, out: &mut String) {
+        match self {
+            Value::Null => out.push_str("null"),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Number(n) => out.push_str(n),
+            Value::String(s) => out.push_str(&quote(s)),
+            Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.write(out);
+                }
+                out.push(']');
+            }
+            Value::Object(members) => {
+                out.push('{');
+                for (i, (name, value)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&quote(name));
+                    out.push(':');
+                    value.write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) => Some(s),
@@ -312,6 +350,14 @@ mod tests {
         assert!(parse("[".repeat(100).as_bytes()).is_err());
         let deep = format!("{}{}", "[".repeat(60), "]".repeat(60));
         assert!(parse(deep.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn writes_documents() {
+        let text = "{ \"a\" : [1, -2.50e+3, true, null, \"x\\ny\"],\n \"b\": {} , \"c\":[] }";
+        let v = parse(text.as_bytes()).unwrap();
+        assert_eq!(v.to_json(), r#"{"a":[1,-2.50e+3,true,null,"x\ny"],"b":{},"c":[]}"#);
+        assert_eq!(parse(v.to_json().as_bytes()).unwrap(), v);
     }
 
     #[test]

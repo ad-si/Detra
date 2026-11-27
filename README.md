@@ -131,8 +131,10 @@ are used from there if their SHA-256 matches.
 It needs disk space for the checkpoint and the converted model
 (8.3 GB for `qwen3.5-2b`, 3.3 GB for `qwen3.5-0.8b`),
 and an interrupted download is resumed when the command runs again.
+Downloads are kept in `$XDG_CACHE_HOME/detra` (default `~/.cache/detra`)
+until the model is installed.
 From a clone of this repository, `make install` builds and installs
-the CLI and the default model instead.
+the CLI and the default model instead (Python is not needed).
 
 ```txt
 detra pull [model]
@@ -141,7 +143,7 @@ detra generate <prompt> [--max-tokens N] [--temperature T] [--top-k K]
 detra generate --prompt-file <path> [...]
 detra info [--model M]
 detra digest <prompts.txt> [--max-tokens N] [--model M]
-detra trace <prompt> | --messages <chat.json> [--max-tokens N] [--logits out.bin]
+detra trace <prompt> | --messages <chat.json> [--max-tokens N] [--logits out.bin] [--model M]
 detra serve [--port N] [--host H] [--allow-origin URL] [--model M]
 detra convert <checkpoint-dir> <out.dllm>
 ```
@@ -156,6 +158,9 @@ The text is printed as it is generated.
 The prompt is used byte for byte; `--prompt-file` reads it from a file
 (every byte counts, including a final newline).
 Put `--` before a prompt that starts with dashes.
+`detra convert` converts a Hugging Face Qwen3.5 checkpoint directory
+(`config.json`, `tokenizer.json`, `model.safetensors`) to a `.dllm` file
+and prints its SHA-256; `detra pull` does this for the supported models.
 
 
 ## Chat Server

@@ -8,4 +8,4 @@ repository.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-detra = { path = "../detra", version = "0.2.0" }
+detra = { path = "../detra", version = "0.3.0" }

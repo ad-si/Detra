@@ -1,7 +1,6 @@
 # Detra
 
-Bit-exact, integer-only LLM inference engine written in Rust.
-No floating point, no dependencies.
+Fully deterministic bit-exact LLM inference engine written in Rust.
 
 The output is a pure function of (model file bytes, prompt bytes, parameters).
 The same inputs produce the same logits and tokens
@@ -14,7 +13,7 @@ Normal engines are not reproducible, even at temperature 0:
 floating-point results depend on the order of additions,
 which varies with hardware, kernels, thread count, and batching.
 
-Advantages:
+**Advantages:**
 
 - **Reproducible:** Anyone can rerun a request and get the same reply,
   so bug reports, evaluations, and research results can be checked.
@@ -25,13 +24,12 @@ Advantages:
 - **Consensus:** Independent machines agree bit for bit
   (e.g. for distributed systems or blockchains).
 
-Disadvantages:
+**Disadvantages:**
 
 - **Slower:** CPU only, about 3× slower generation
   and 65–75× slower prompt processing than MLX on a GPU (see [Performance]).
 - **Few models:** Only Qwen3.5-2B and Qwen3.5-0.8B.
-- **Limited features:** No tools, images, or thinking mode,
-  and the server runs one generation at a time.
+- **Limited features:** No tools, images, or thinking mode yet.
 
 [Performance]: #performance
 [uv]: https://docs.astral.sh/uv/

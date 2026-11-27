@@ -8,6 +8,35 @@ The same inputs produce the same logits and tokens
 on every machine, build profile, and target.
 
 
+## Compared to Normal Inference Engines
+
+Normal engines are not reproducible, even at temperature 0:
+floating-point results depend on the order of additions,
+which varies with hardware, kernels, thread count, and batching.
+
+Advantages:
+
+- **Reproducible:** Anyone can rerun a request and get the same reply,
+  so bug reports, evaluations, and research results can be checked.
+- **Verifiable:** A third party can confirm that a model produced a given reply.
+- **Exact tests:** Outputs can be compared byte for byte, without tolerances.
+- **Seeded sampling:** Any temperature gives the same text for the same seed.
+- **Cacheable:** Identical requests always have identical replies.
+- **Consensus:** Independent machines agree bit for bit
+  (e.g. for distributed systems or blockchains).
+
+Disadvantages:
+
+- **Slower:** CPU only, about 3× slower generation
+  and 75× slower prompt processing than MLX on a GPU (see [Performance]).
+- **Few models:** Only Qwen3.5-0.8B and stories15M,
+  each needing an offline conversion.
+- **Limited features:** No tools, images, or thinking mode,
+  and the server runs one generation at a time.
+
+[Performance]: #performance
+
+
 ## How It Works
 
 - No floating point anywhere in the engine crate (enforced by `make lint`).

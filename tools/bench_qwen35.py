@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["mlx-lm", "torch", "transformers"]
 # ///
-"""Benchmark the integer engine against float implementations of Qwen3.5-0.8B.
+"""Benchmark the integer engine against float implementations of a Qwen3.5 model.
 
 Usage: uv run tools/bench_qwen35.py <model-dir> <model.dllm> [--torch] [detra-binary]
 

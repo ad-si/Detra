@@ -28,8 +28,9 @@ Advantages:
 Disadvantages:
 
 - **Slower:** CPU only, about 3× slower generation
-  and 75× slower prompt processing than MLX on a GPU (see [Performance]).
-- **One model:** Only Qwen3.5-0.8B, which needs an offline conversion.
+  and 65–75× slower prompt processing than MLX on a GPU (see [Performance]).
+- **Few models:** Only Qwen3.5-2B and Qwen3.5-0.8B,
+  which need an offline conversion.
 - **Limited features:** No tools, images, or thinking mode,
   and the server runs one generation at a time.
 
@@ -54,7 +55,10 @@ Disadvantages:
   Floating point is only used in the offline converters
   (`detra-convert` and `tools/convert_qwen35.py`).
 
-The supported model is [Qwen3.5-0.8B] (text part only, thinking mode off).
+The supported models are [Qwen3.5-2B] (the default)
+and [Qwen3.5-0.8B] (about 2.3× faster, lower quality),
+both text part only, thinking mode off.
+`make install QWEN_MODEL=qwen3.5-0.8b` installs the smaller one instead.
 For testing, the 15M-parameter [stories15M] from [llama2.c] is also used:
 it is small enough to run under emulation, so it is verified on every architecture.
 It is not meant for actual use.
@@ -62,6 +66,7 @@ It is not meant for actual use.
 The engine does not apply Unicode normalization:
 prompts should be in NFC to match the original Qwen tokenizer.
 
+[Qwen3.5-2B]: https://huggingface.co/Qwen/Qwen3.5-2B
 [Qwen3.5-0.8B]: https://huggingface.co/Qwen/Qwen3.5-0.8B
 [stories15M]: https://huggingface.co/karpathy/tinyllamas
 [llama2.c]: https://github.com/karpathy/llama2.c
@@ -187,19 +192,20 @@ The `verify` targets compare that output with the files in `golden/`:
 
 | Target                    | Checks                                                               |
 | ------------------------- | -------------------------------------------------------------------- |
-| `make verify-native`      | Native release build, both models (Qwen also single-threaded)        |
+| `make verify-native`      | Native release build, all models (Qwen also single-threaded)         |
 | `make verify-debug`       | Unoptimized build with overflow checks enabled (stories15M)          |
-| `make verify-x86_64`      | x86-64 build run under Rosetta, both models                          |
+| `make verify-x86_64`      | x86-64 build run under Rosetta, all models                           |
 | `make verify-wasm`        | WebAssembly (32-bit) build run under Node's WASI (stories15M)        |
 | `make verify-miri`        | Synthetic models on big-endian 64-bit and 32-bit targets             |
 | `make verify-docker`      | Emulated big-endian s390x, 32-bit x86, and x86-64 Linux (stories15M) |
-| `make verify-docker-qwen` | Qwen3.5-0.8B on emulated big-endian s390x Linux                      |
+| `make verify-docker-qwen` | Both Qwen3.5 models on emulated big-endian s390x Linux               |
 
 `make verify` runs the tests, the linter, and the first four.
 `make test` runs the test-suite natively in debug and release builds;
 the x86-64, WASM, Miri, and `verify-docker` targets also run it on their architecture.
 `make check-qwen` compares the integer engine
-with the Hugging Face float implementation of Qwen3.5,
+with the Hugging Face float implementation of Qwen3.5-2B
+(`QWEN_MODEL=qwen3.5-0.8b` for the smaller model),
 including the chat template for multi-turn conversations.
 `make setup` installs the required Rust targets and components.
 Run `make help` for all targets.
@@ -207,14 +213,17 @@ Run `make help` for all targets.
 
 ## Performance
 
-Qwen3.5-0.8B on an Apple M4 Max (10 performance cores), greedy decoding,
+Apple M4 Max (10 performance cores), greedy decoding,
 1030-token prompt, 200 generated tokens (`tools/bench_qwen35.py`):
 
-| Runtime                          | Prompt       | Generation  | Peak memory |
-| -------------------------------- | ------------ | ----------- | ----------- |
-| Detra (integer, CPU)             | ~105 tok/s   | ~65 tok/s   | 1.5 GiB     |
-| Detra (integer, CPU, 1 thread)   | ~18 tok/s    | ~12 tok/s   | 1.5 GiB     |
-| MLX (bfloat16, GPU)              | ~7800 tok/s  | ~185 tok/s  | 1.5 GiB     |
+| Model        | Runtime                        | Prompt      | Generation | Peak memory |
+| ------------ | ------------------------------ | ----------- | ---------- | ----------- |
+| Qwen3.5-2B   | Detra (integer, CPU)           | ~45 tok/s   | ~29 tok/s  | 3.6 GiB     |
+| Qwen3.5-2B   | Detra (integer, CPU, 1 thread) | ~7 tok/s    | ~5 tok/s   | 3.6 GiB     |
+| Qwen3.5-2B   | MLX (bfloat16, GPU)            | ~2900 tok/s | ~85 tok/s  | 3.6 GiB     |
+| Qwen3.5-0.8B | Detra (integer, CPU)           | ~105 tok/s  | ~65 tok/s  | 1.5 GiB     |
+| Qwen3.5-0.8B | Detra (integer, CPU, 1 thread) | ~18 tok/s   | ~12 tok/s  | 1.5 GiB     |
+| Qwen3.5-0.8B | MLX (bfloat16, GPU)            | ~7800 tok/s | ~185 tok/s | 1.5 GiB     |
 
 Generation is limited by memory bandwidth (every token reads all weights once),
 prompt processing by integer multiply-accumulate throughput on the CPU.

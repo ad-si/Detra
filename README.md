@@ -226,5 +226,10 @@ prompt processing by integer multiply-accumulate throughput on the CPU.
     for Qwen3-0.6B in Python / PyTorch.
     Integer-only from input ids to int32 logits,
     with a cuBLASLt int8 GEMM backend for CUDA and a CPU reference backend.
+- [pelloran-inc/tritify] - Inference engine in Rust that runs LLMs
+    (including Mixture-of-Experts) and Segment Anything 2.1
+    in exact integer arithmetic for bit-identical output across CPU and GPU.
+    Supports distributed inference and an OpenAI-compatible server.
 
 [nathanrs/detllm]: https://github.com/nathanrs/detllm
+[pelloran-inc/tritify]: https://github.com/pelloran-inc/tritify

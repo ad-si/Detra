@@ -2,8 +2,8 @@
 //! DLLM format, in integer arithmetic only, so that the converted file is the same on
 //! every machine.
 //!
-//! A checkpoint is a `config.json`, a `tokenizer.json` and a single `.safetensors`
-//! file. The vision tower and the multi-token-prediction head are ignored.
+//! A checkpoint is a `config.json`, a `tokenizer.json` and one or more `.safetensors`
+//! files. The vision tower and the multi-token-prediction head are ignored.
 //!
 //! - Weights are scaled by 2^24 and rounded to the nearest integer, ties to even.
 //!   Matrices are stored packed when every value allows it.
@@ -266,6 +266,28 @@ impl SafeTensors {
     }
 }
 
+/// The weights of a checkpoint, possibly split over several files.
+struct Shards(Vec<SafeTensors>);
+
+impl Shards {
+    fn open(paths: &[PathBuf]) -> Result<Shards> {
+        if paths.is_empty() {
+            return err("the checkpoint has no weights");
+        }
+        paths.iter().map(|p| SafeTensors::open(p)).collect::<Result<Vec<_>>>().map(Shards)
+    }
+
+    /// The tensor `name`, which must be in exactly one of the files.
+    fn get(&mut self, name: &str) -> Result<Raw> {
+        let mut holders = self.0.iter_mut().filter(|s| s.header.get(name).is_some());
+        match (holders.next(), holders.next()) {
+            (Some(shard), None) => shard.get(name),
+            (None, _) => err(format!("{name}: tensor is missing")),
+            (Some(_), Some(_)) => err(format!("{name}: tensor is in more than one file")),
+        }
+    }
+}
+
 /// Inverse of the GPT-2 byte-to-character table of byte-level BPE vocabularies.
 fn byte_chars() -> [char; 256] {
     let direct = |b: u32| (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
@@ -332,18 +354,36 @@ fn a_exp(raw: &Raw, heads: usize) -> Result<Vec<i32>> {
 pub struct Checkpoint {
     pub config: PathBuf,
     pub tokenizer: PathBuf,
-    pub weights: PathBuf,
+    /// The weights, in any order. Every tensor must be in exactly one of them.
+    pub weights: Vec<PathBuf>,
 }
 
 impl Checkpoint {
-    /// The checkpoint in a directory with `config.json`, `tokenizer.json` and
-    /// `model.safetensors`.
-    pub fn in_dir(dir: &Path) -> Checkpoint {
-        Checkpoint {
-            config: dir.join("config.json"),
-            tokenizer: dir.join("tokenizer.json"),
-            weights: dir.join("model.safetensors"),
-        }
+    /// The checkpoint in a directory with `config.json`, `tokenizer.json` and either
+    /// `model.safetensors` or the shards listed in `model.safetensors.index.json`.
+    pub fn in_dir(dir: &Path) -> Result<Checkpoint> {
+        let single = dir.join("model.safetensors");
+        let weights = if single.exists() {
+            vec![single]
+        } else {
+            let index = dir.join("model.safetensors.index.json");
+            let index = json::parse(&read_file(&index)?).map_err(|e| Error(format!("{}: {e}", index.display())))?;
+            let Some(Value::Object(map)) = index.get("weight_map") else {
+                return err("model.safetensors.index.json has no weight_map");
+            };
+            let mut shards = Vec::new();
+            for (_, file) in map {
+                let file = file.as_str().ok_or_else(|| Error("weight_map entry is not a file name".into()))?;
+                if file.is_empty() || file.contains(['/', '\\']) || file.starts_with('.') {
+                    return err(format!("weight_map refers to {file:?}"));
+                }
+                shards.push(dir.join(file));
+            }
+            shards.sort();
+            shards.dedup();
+            shards
+        };
+        Ok(Checkpoint { config: dir.join("config.json"), tokenizer: dir.join("tokenizer.json"), weights })
     }
 }
 
@@ -364,14 +404,14 @@ pub fn convert(files: &Checkpoint, mut progress: impl FnMut(&str)) -> Result<Mod
     let (dim, hidden, n_layers) = (int(cfg, "hidden_size")?, int(cfg, "intermediate_size")?, int(cfg, "num_hidden_layers")?);
     let (vocab_size, head_dim) = (int(cfg, "vocab_size")?, int(cfg, "head_dim")?);
     let (n_heads, n_kv) = (int(cfg, "num_attention_heads")?, int(cfg, "num_key_value_heads")?);
-    let lin_heads = int(cfg, "linear_num_key_heads")?;
-    if int(cfg, "linear_num_value_heads")? != lin_heads {
-        return Err(unsupported("different numbers of key and value heads"));
+    let (lin_k_heads, lin_v_heads) = (int(cfg, "linear_num_key_heads")?, int(cfg, "linear_num_value_heads")?);
+    if lin_k_heads == 0 || !lin_v_heads.is_multiple_of(lin_k_heads) {
+        return Err(unsupported("linear_num_value_heads is not a multiple of linear_num_key_heads"));
     }
     let (kd, vd, kernel) =
         (int(cfg, "linear_key_head_dim")?, int(cfg, "linear_value_head_dim")?, int(cfg, "linear_conv_kernel_dim")?);
     // The engine's limits, checked before anything is allocated from these sizes.
-    if [dim, hidden, n_layers, n_heads, n_kv, lin_heads, kd, vd, kernel].iter().any(|&n| n > 1 << 20)
+    if [dim, hidden, n_layers, n_heads, n_kv, lin_k_heads, lin_v_heads, kd, vd, kernel].iter().any(|&n| n > 1 << 20)
         || vocab_size > 1 << 24
         || head_dim > 1 << 14
     {
@@ -405,15 +445,15 @@ pub fn convert(files: &Checkpoint, mut progress: impl FnMut(&str)) -> Result<Mod
         return Err(unsupported("layer_types does not match num_hidden_layers"));
     }
     let seq_len = SEQ_LEN.min(int(cfg, "max_position_embeddings")?);
-    let (key_dim, value_dim) = (lin_heads * kd, lin_heads * vd);
+    let (key_dim, value_dim) = (lin_k_heads * kd, lin_v_heads * vd);
     let conv_dim = 2 * key_dim + value_dim;
     let out_gate = flag(cfg, "attn_output_gate")?;
 
-    let mut st = SafeTensors::open(&files.weights)?;
+    let mut st = Shards::open(&files.weights)?;
     let lm = "model.language_model.";
     progress("embeddings");
     let tok_emb = st.get(&format!("{lm}embed_tokens.weight"))?.matrix(&[vocab_size, dim])?;
-    let norm = |st: &mut SafeTensors, name: &str, n: usize| st.get(name)?.fixed(&[n], 24, 1 << 24);
+    let norm = |st: &mut Shards, name: &str, n: usize| st.get(name)?.fixed(&[n], 24, 1 << 24);
     let mut layers = Vec::new();
     for (i, &kind) in layer_types.iter().enumerate() {
         progress(&format!("layer {} of {n_layers}", i + 1));
@@ -434,11 +474,11 @@ pub fn convert(files: &Checkpoint, mut progress: impl FnMut(&str)) -> Result<Mod
             Mixer::Delta(Delta {
                 w_qkv: st.get(&format!("{g}in_proj_qkv.weight"))?.matrix(&[conv_dim, dim])?,
                 w_z: st.get(&format!("{g}in_proj_z.weight"))?.matrix(&[value_dim, dim])?,
-                w_b: st.get(&format!("{g}in_proj_b.weight"))?.matrix(&[lin_heads, dim])?,
-                w_a: st.get(&format!("{g}in_proj_a.weight"))?.matrix(&[lin_heads, dim])?,
+                w_b: st.get(&format!("{g}in_proj_b.weight"))?.matrix(&[lin_v_heads, dim])?,
+                w_a: st.get(&format!("{g}in_proj_a.weight"))?.matrix(&[lin_v_heads, dim])?,
                 conv: st.get(&format!("{g}conv1d.weight"))?.reshaped(&[conv_dim, kernel])?.fixed(&[conv_dim, kernel], 24, 0)?,
-                a_exp: a_exp(&st.get(&format!("{g}A_log"))?, lin_heads)?,
-                dt_bias: st.get(&format!("{g}dt_bias"))?.fixed(&[lin_heads], 24, 0)?,
+                a_exp: a_exp(&st.get(&format!("{g}A_log"))?, lin_v_heads)?,
+                dt_bias: st.get(&format!("{g}dt_bias"))?.fixed(&[lin_v_heads], 24, 0)?,
                 gnorm: st.get(&format!("{g}norm.weight"))?.fixed(&[vd], 24, 0)?,
                 w_out: st.get(&format!("{g}out_proj.weight"))?.matrix(&[dim, value_dim])?,
             })
@@ -529,7 +569,8 @@ pub fn convert(files: &Checkpoint, mut progress: impl FnMut(&str)) -> Result<Mod
         rope_halves: true,
         qk_norm: true,
         out_gate,
-        lin_heads,
+        lin_k_heads,
+        lin_v_heads,
         lin_k_dim: kd,
         lin_v_dim: vd,
         conv_kernel: kernel,

@@ -95,7 +95,7 @@ def main():
 
     def prompt_ids(text):
         messages = [{"role": "user", "content": text}]
-        rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         return tok(rendered, add_special_tokens=False).input_ids
 
     failures = 0
@@ -111,7 +111,7 @@ def main():
             print("   want", want, "\n   got ", got)
 
     for messages in CHATS:
-        rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         want = tok(rendered, add_special_tokens=False).input_ids
         got = trace_chat(binary, dllm, messages)
         ok = got == want

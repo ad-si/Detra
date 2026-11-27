@@ -32,8 +32,8 @@ Usage:
                [--model M]
   detra convert <checkpoint-dir> <out.dllm>
 
-Models: qwen3.5-2b (the default) and qwen3.5-0.8b. A model M is one of these names or
-the path of a .dllm file. Without --model, $DETRA_MODEL is used, or else qwen3.5-2b.
+Models: qwen3.5-2b (the default), qwen3.5-0.8b and qwen3.5-4b. A model M is one of
+these names or the path of a .dllm file. Without --model, $DETRA_MODEL is used, or else qwen3.5-2b.
 Installed models are in $XDG_DATA_HOME/detra (default ~/.local/share/detra).
 
 pull:     downloads a model's checkpoint from Hugging Face (with curl), converts it and
@@ -44,7 +44,8 @@ pull:     downloads a model's checkpoint from Hugging Face (with curl), converts
           the model is installed. Needs disk space for the checkpoint and the converted
           model (8.3 GB for qwen3.5-2b).
 convert:  converts a Hugging Face Qwen3.5 checkpoint directory (config.json,
-          tokenizer.json, model.safetensors) and prints the SHA-256 of the result.
+          tokenizer.json, and model.safetensors or the shards listed in
+          model.safetensors.index.json) and prints the SHA-256 of the result.
 generate: temperature 0 (the default) is greedy decoding. T and P are decimals.
           The prompt is used byte for byte; --prompt-file reads it from a file (every
           byte counts, including a final newline). Put `--` before a prompt that
@@ -263,7 +264,8 @@ fn run(args: &[OsString]) -> Result<(), String> {
         }
         ("convert", [dir, out]) => {
             let out = Path::new(out);
-            let sha = pull::convert(&detra::qwen35::Checkpoint::in_dir(Path::new(dir)), out)?;
+            let checkpoint = detra::qwen35::Checkpoint::in_dir(Path::new(dir)).map_err(|e| e.to_string())?;
+            let sha = pull::convert(&checkpoint, out)?;
             println!("{sha}  {}", out.display());
             Ok(())
         }

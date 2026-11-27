@@ -24,20 +24,20 @@ pub struct Release {
     pub repo: &'static str,
     /// Pinned revision of the repository.
     pub revision: &'static str,
-    /// Config, tokenizer and weights, in this order.
-    pub files: [Download; 3],
+    /// Config, tokenizer and the weights (one or more files), in this order.
+    pub files: &'static [Download],
     /// SHA-256 of the converted model file, which identifies the model.
     pub sha256: &'static str,
 }
 
 pub const DEFAULT: &str = "qwen3.5-2b";
 
-pub const RELEASES: [Release; 2] = [
+pub const RELEASES: [Release; 3] = [
     Release {
         name: "qwen3.5-2b",
         repo: "Qwen/Qwen3.5-2B",
         revision: "15852e8c16360a2fea060d615a32b45270f8a8fc",
-        files: [
+        files: &[
             Download {
                 remote: "config.json",
                 local: "config.json",
@@ -57,13 +57,13 @@ pub const RELEASES: [Release; 2] = [
                 sha256: "aa33250c4fc64891ddfaba3a314fd9542ea371843c387178b425fbcc5ed680b1",
             },
         ],
-        sha256: "7ddcff1fc73deaf59b3242ec5b53e13b9eb0626103262650753196ed33adcf9c",
+        sha256: "ddb68c247514e73b9ee90158ae3dc7dcbed328681b22d8eee14fcbacfdcd24a5",
     },
     Release {
         name: "qwen3.5-0.8b",
         repo: "Qwen/Qwen3.5-0.8B",
         revision: "2fc06364715b967f1860aea9cf38778875588b17",
-        files: [
+        files: &[
             Download {
                 remote: "config.json",
                 local: "config.json",
@@ -83,7 +83,39 @@ pub const RELEASES: [Release; 2] = [
                 sha256: "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
             },
         ],
-        sha256: "cb09481df4b531deaf63d314720396023c1fc7cd54066514993cfcbe5a60f203",
+        sha256: "cc9ab7de7bc1d56034462f542d3ff8588f0538981945686be54f9552cb47f862",
+    },
+    Release {
+        name: "qwen3.5-4b",
+        repo: "Qwen/Qwen3.5-4B",
+        revision: "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        files: &[
+            Download {
+                remote: "config.json",
+                local: "config.json",
+                size: 3161,
+                sha256: "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+            },
+            Download {
+                remote: "tokenizer.json",
+                local: "tokenizer.json",
+                size: 12_807_982,
+                sha256: "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+            },
+            Download {
+                remote: "model.safetensors-00001-of-00002.safetensors",
+                local: "model.safetensors-00001-of-00002.safetensors",
+                size: 5_329_398_688,
+                sha256: "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61",
+            },
+            Download {
+                remote: "model.safetensors-00002-of-00002.safetensors",
+                local: "model.safetensors-00002-of-00002.safetensors",
+                size: 3_990_429_408,
+                sha256: "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188",
+            },
+        ],
+        sha256: "79e0d5bb3f57f69ff50ced5523c78b35c1e2278784e412c8368a04a77f991ea2",
     },
 ];
 
@@ -263,7 +295,7 @@ pub fn pull(release: &Release) -> Result<(), String> {
     }
     let cache = env_dir("XDG_CACHE_HOME", ".cache")?.join("detra").join(release.name);
     let mut paths = Vec::new();
-    for file in &release.files {
+    for file in release.files {
         if let Some(path) = find_cached(release, file) {
             eprintln!("Using {}", path.display());
             paths.push(path);
@@ -275,8 +307,9 @@ pub fn pull(release: &Release) -> Result<(), String> {
         download(&url, file, &dest)?;
         paths.push(dest);
     }
-    let [config, tokenizer, weights] = <[PathBuf; 3]>::try_from(paths).map_err(|_| "missing checkpoint file")?;
-    let checkpoint = Checkpoint { config, tokenizer, weights };
+    let mut paths = paths.into_iter();
+    let (Some(config), Some(tokenizer)) = (paths.next(), paths.next()) else { return Err("missing checkpoint file".into()) };
+    let checkpoint = Checkpoint { config, tokenizer, weights: paths.collect() };
     let dir = data_dir()?;
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
     let mut converted = dest.as_os_str().to_owned();

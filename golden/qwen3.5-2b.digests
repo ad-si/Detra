@@ -1,4 +1,4 @@
-model 7ddcff1fc73deaf59b3242ec5b53e13b9eb0626103262650753196ed33adcf9c
+model ddb68c247514e73b9ee90158ae3dc7dcbed328681b22d8eee14fcbacfdcd24a5
 000 greedy  64 tokens f4546c0c4eb4c1d3a6c1ab6c03946b59d7bd62cbddf6b7cfdaf75cda769e2a3d
 000 sample  64 tokens ead89f3ca83a827341534e0b006a67e8ec54df99f7a9a60e9155ae79505aae3a
 001 greedy  69 tokens f482a788a8dcdafa4bca3d2916195f280284b1c04151ad0f1d4a62afa45688d6
@@ -21,4 +21,4 @@ model 7ddcff1fc73deaf59b3242ec5b53e13b9eb0626103262650753196ed33adcf9c
 009 sample 160 tokens 1c7ca99f06aba4197261c0d6d054c98af17f281e4dedf7bc45f7f660f3ada884
 010 greedy error: prompt has 5614 tokens but the context window holds 4096
 010 sample error: prompt has 5614 tokens but the context window holds 4096
-total 3a3ded79accff52d9ee757d3f77d1bde028a645a43ed6d0597e9a2c7464a07ce
+total a4d9bf5deb8289569af8b432e83931e8456cefe7047e58d944386aaa9e75615f

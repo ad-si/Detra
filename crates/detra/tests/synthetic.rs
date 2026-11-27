@@ -73,7 +73,8 @@ fn llama_like() -> Model {
         rope_halves: false,
         qk_norm: false,
         out_gate: false,
-        lin_heads: 0,
+        lin_k_heads: 0,
+        lin_v_heads: 0,
         lin_k_dim: 0,
         lin_v_dim: 0,
         conv_kernel: 0,
@@ -105,12 +106,22 @@ const T_END: u32 = 262;
 /// Qwen3.5-style model: gated delta and gated attention layers, grouped keys/values,
 /// query/key norm, partial split-half RoPE, tied classifier, byte-level BPE tokenizer.
 fn qwen_like() -> Model {
+    qwen_like_with(2, 2, 0x35)
+}
+
+/// Like [`qwen_like`], but in the gated delta layers every query and key head is shared
+/// by two value heads (as in Qwen3.5-4B).
+fn qwen_like_grouped() -> Model {
+    qwen_like_with(2, 4, 0x354)
+}
+
+fn qwen_like_with(lin_k_heads: usize, lin_v_heads: usize, seed: u64) -> Model {
     let (dim, hidden_dim, seq_len) = (16usize, 24usize, 40usize);
     let (n_heads, n_kv_heads, head_dim, rotary_dim) = (4usize, 2usize, 8usize, 4usize);
-    let (lin_heads, lin_k_dim, lin_v_dim, conv_kernel) = (2usize, 4usize, 6usize, 3usize);
-    let (key_dim, value_dim) = (lin_heads * lin_k_dim, lin_heads * lin_v_dim);
+    let (lin_k_dim, lin_v_dim, conv_kernel) = (4usize, 6usize, 3usize);
+    let (key_dim, value_dim) = (lin_k_heads * lin_k_dim, lin_v_heads * lin_v_dim);
     let conv_dim = 2 * key_dim + value_dim;
-    let mut w = Weights(Rng::new(0x35));
+    let mut w = Weights(Rng::new(seed));
 
     let mut tokens: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
     for t in ["th", "the", " the", "an", "and", "<|start|>", "<|end|>"] {
@@ -156,11 +167,11 @@ fn qwen_like() -> Model {
             Mixer::Delta(Delta {
                 w_qkv: w.q24(conv_dim * dim).into(),
                 w_z: w.q24(value_dim * dim).into(),
-                w_b: w.q24(lin_heads * dim).into(),
-                w_a: w.q24(lin_heads * dim).into(),
+                w_b: w.q24(lin_v_heads * dim).into(),
+                w_a: w.q24(lin_v_heads * dim).into(),
                 conv: w.q24(conv_dim * conv_kernel),
-                a_exp: w.positive(lin_heads),
-                dt_bias: w.q24(lin_heads),
+                a_exp: w.positive(lin_v_heads),
+                dt_bias: w.q24(lin_v_heads),
                 gnorm: w.positive(lin_v_dim),
                 w_out: w.q24(dim * value_dim).into(),
             })
@@ -181,7 +192,8 @@ fn qwen_like() -> Model {
         rope_halves: true,
         qk_norm: true,
         out_gate: true,
-        lin_heads,
+        lin_k_heads,
+        lin_v_heads,
         lin_k_dim,
         lin_v_dim,
         conv_kernel,
@@ -210,8 +222,9 @@ fn qwen_like() -> Model {
 #[test]
 fn file_format_roundtrip() {
     for (model, digest) in [
-        (llama_like(), "23a89b0ef078f14eeaa53f8413d779aa4c9d2087dc274962f7b3f7bc51517563"),
-        (qwen_like(), "9f69ebe2ffb95bdfb3b33ab4aab32103b39d64c1d9bbda46d9043a8e565847ad"),
+        (llama_like(), "074897a352cbca9d7eb7553a4569746e5645a4bcd0f0bfabc4185920dfa6ba91"),
+        (qwen_like(), "de4070156f5b8b3e94c9af64f142c8df9ea4f902bba996c9b1f676b10b02b274"),
+        (qwen_like_grouped(), "bf83ede27a2fc1aa82e0870a2ec989fcd29759e5943bcb08a4e530ab73651d94"),
     ] {
         let bytes = model.to_bytes().unwrap();
         assert_eq!(Model::from_bytes(&bytes).unwrap(), model);
@@ -221,6 +234,25 @@ fn file_format_roundtrip() {
         assert!(Model::from_bytes(&extra).is_err());
         assert_eq!(hex(&sha256(&bytes)), digest);
     }
+}
+
+/// Version 4 files, which have no `lin_v_heads` field, are still read.
+#[test]
+fn reads_version_4_files() {
+    let model = qwen_like();
+    let mut bytes = model.to_bytes().unwrap();
+    // magic, version, then `lin_v_heads` is the 15th header field after the version.
+    let at = 4 + 4 * 15;
+    assert_eq!(bytes[at - 4..at + 4], [2, 0, 0, 0, 2, 0, 0, 0]);
+    bytes.drain(at..at + 4);
+    bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+    assert_eq!(Model::from_bytes(&bytes).unwrap(), model);
+}
+
+#[test]
+fn value_heads_must_be_a_multiple_of_key_heads() {
+    let e = qwen_like_with(2, 3, 1).to_bytes().unwrap_err();
+    assert_eq!(e.0, "lin_v_heads is not a multiple of lin_k_heads");
 }
 
 #[test]
@@ -301,6 +333,54 @@ fn qwen_like_digests_are_fixed() {
     let (greedy, sampled) = digests(qwen_like(), b"the and 12 then", 1);
     assert_eq!(greedy, "9d2900a1c1c82ca84eb0c1bafd2634355545b5146d9c8659f0e7b84c952d055b");
     assert_eq!(sampled, "036a2be44cba63eb3804ba85f6ca31dffe34e62a30bc9ec240da7cd5551b36f9");
+}
+
+#[test]
+fn qwen_like_grouped_digests_are_fixed() {
+    let (greedy, sampled) = digests(qwen_like_grouped(), b"the and 12 then", 1);
+    assert_eq!(greedy, "9198140af3b7dad07bade84068e892d634ce860b798c4983c7868cabfc356bcd");
+    assert_eq!(sampled, "6464ef1d5a3c45ea8d4bcde63536e7becc6e8b187bc04efe283cfb338fb2448a");
+}
+
+/// The same model with every query and key head of the gated delta layers stored once
+/// per value head that uses it, so that no head is shared.
+fn ungrouped(mut model: Model) -> Model {
+    let (kd, ratio) = (model.lin_k_dim, model.lin_v_heads / model.lin_k_heads);
+    let key_dim = model.lin_k();
+    let (dim, kernel) = (model.dim, model.conv_kernel);
+    // Rows of `[2K + V, row]`: query rows, key rows (repeated per value head), value rows.
+    let repeat = |values: Vec<i32>, row: usize| -> Vec<i32> {
+        let rows = |from: usize, n: usize| values[from * row..(from + n) * row].to_vec();
+        let mut out = Vec::new();
+        for part in [0, key_dim] {
+            for h in 0..model.lin_v_heads {
+                out.extend(rows(part + (h / ratio) * kd, kd));
+            }
+        }
+        out.extend(rows(2 * key_dim, values.len() / row - 2 * key_dim));
+        out
+    };
+    for layer in &mut model.layers {
+        if let Mixer::Delta(g) = &mut layer.mixer {
+            let qkv: Vec<i32> = (0..g.w_qkv.len()).map(|i| g.w_qkv.get(i)).collect();
+            g.w_qkv = repeat(qkv, dim).into();
+            g.conv = repeat(std::mem::take(&mut g.conv), kernel);
+        }
+    }
+    model.lin_k_heads = model.lin_v_heads;
+    model
+}
+
+/// Sharing a query and key head between value heads is the same as giving every value
+/// head its own copy of them.
+#[test]
+fn grouped_heads_equal_repeated_heads() {
+    let model = qwen_like_grouped();
+    let twin = ungrouped(model.clone());
+    assert_eq!(twin.lin_k_heads, 4);
+    assert_eq!(digests(twin.clone(), b"the and 12 then the", 1), digests(model.clone(), b"the and 12 then the", 1));
+    let cases = if cfg!(miri) { 4 } else { 40 };
+    assert_eq!(fuzz_digest(twin, 22, cases), fuzz_digest(model, 22, cases));
 }
 
 /// Threads are unavailable on some targets (and slow under Miri); everywhere else the
@@ -505,6 +585,7 @@ fn fuzz_digest(model: Model, seed: u64, cases: usize) -> String {
 fn arbitrary_inputs_have_fixed_digests() {
     assert_eq!(fuzz_digest(llama_like(), 1, 300), "c6c246349a7d23a4be7d26d3ded256a4af8ab112795f27514f8cc79ea8580ece");
     assert_eq!(fuzz_digest(qwen_like(), 2, 300), "b3987e59e6ce677d902bff684525945b1c26e7f97a7c824b596cbfe0a66c3d67");
+    assert_eq!(fuzz_digest(qwen_like_grouped(), 7, 300), "e45c2e73543c729e1469cd3ea167c226a8658e1ed2832703f339ffc1b973c284");
 }
 
 /// The same with weights at the extremes of their range, where sums wrap and
@@ -523,7 +604,7 @@ fn extreme_weights_have_fixed_digests() {
 fn corrupted_model_files_have_fixed_outcomes() {
     let mut all = detra::sha256::Sha256::new();
     let (mut loaded, mut rejected) = (0, 0);
-    for (model, seed) in [(llama_like(), 11), (qwen_like(), 12)] {
+    for (model, seed) in [(llama_like(), 11), (qwen_like(), 12), (qwen_like_grouped(), 13)] {
         let bytes = model.to_bytes().unwrap();
         let mut rng = Rng::new(seed);
         for case in 0..400 {
@@ -563,7 +644,7 @@ fn corrupted_model_files_have_fixed_outcomes() {
         }
     }
     assert!(loaded > 100 && rejected > 100, "loaded {loaded}, rejected {rejected}");
-    assert_eq!(hex(&all.finalize()), "c8e8041d71add09dab60e3e1536edde8d2b0c53a7ba947b3f350501bb7d0ca29");
+    assert_eq!(hex(&all.finalize()), "f5369199ac3bc36c3c7944c3ae1018d222215893ef63fb5f4b033fe959ae54e3");
 }
 
 #[test]

@@ -1,7 +1,8 @@
 # Models:
 #   qwen3.5-2b    Qwen3.5-2B (text part). The default model, installed by `make install`.
 #   qwen3.5-0.8b  Qwen3.5-0.8B (text part). About 2.3x faster, lower quality.
-#   Both are converted by `detra convert`, the same integer-only converter `detra pull` uses.
+#   qwen3.5-4b    Qwen3.5-4B (text part). Slower, higher quality.
+#   All three are converted by `detra convert`, the same integer-only converter `detra pull` uses.
 #   stories15M    15M-parameter Llama-style test model. Small enough to run under emulation,
 #                 so it is the one verified on every architecture. Not meant for actual use.
 # `install`, `serve` and `check-qwen` use $(QWEN_MODEL), e.g. `make install QWEN_MODEL=qwen3.5-0.8b`.
@@ -10,13 +11,16 @@ STORIES_URL := https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15
 STORIES_TOK_URL := https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin
 QWEN_2B_URL := https://huggingface.co/Qwen/Qwen3.5-2B/resolve/15852e8c16360a2fea060d615a32b45270f8a8fc
 QWEN_08B_URL := https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/2fc06364715b967f1860aea9cf38778875588b17
+QWEN_4B_URL := https://huggingface.co/Qwen/Qwen3.5-4B/resolve/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
 STORIES := models/stories15M.dllm
 QWEN := models/$(QWEN_MODEL).dllm
 QWEN_2B := models/qwen3.5-2b.dllm
 QWEN_08B := models/qwen3.5-0.8b.dllm
+QWEN_4B := models/qwen3.5-4b.dllm
 GOLDEN_STORIES := golden/stories15M.digests
 GOLDEN_QWEN_2B := golden/qwen3.5-2b.digests
 GOLDEN_QWEN_08B := golden/qwen3.5-0.8b.digests
+GOLDEN_QWEN_4B := golden/qwen3.5-4b.digests
 RUST_IMAGE ?= rust:1-slim
 DATA_DIR := $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/detra
 MIRI_TEST := cargo +nightly miri test -p detra --test synthetic
@@ -64,21 +68,30 @@ UCD := target/ucd-$(UNICODE_VERSION)
 CONVERTER := $(addprefix crates/detra/src/,qwen35.rs exact.rs unicode_classes.rs model.rs tokenizer.rs)
 
 # Download and conversion rules for one Qwen3.5 checkpoint.
-# $(1) = model name (directory under models/), $(2) = Hugging Face URL at a pinned revision
+# $(1) = model name (directory under models/), $(2) = Hugging Face URL at a pinned revision,
+# $(3) = weight files: model.safetensors for a single file (stored under that name),
+# or model.safetensors.index.json and the shards it lists.
 define qwen_rules
 models/$(1)/model.safetensors:
 	mkdir -p models/$(1)
 	curl -L --fail -o $$@ $(2)/model.safetensors-00001-of-00001.safetensors
 
-models/$(1)/config.json models/$(1)/tokenizer.json models/$(1)/tokenizer_config.json models/$(1)/chat_template.jinja:
+models/$(1)/config.json models/$(1)/tokenizer.json models/$(1)/tokenizer_config.json models/$(1)/chat_template.jinja \
+		models/$(1)/model.safetensors.index.json:
 	mkdir -p models/$(1)
 	curl -L --fail -o $$@ $(2)/$$(notdir $$@)
 
-models/$(1).dllm: models/$(1)/model.safetensors models/$(1)/config.json models/$(1)/tokenizer.json $(CONVERTER) | build
+models/$(1)/model.safetensors-%.safetensors:
+	mkdir -p models/$(1)
+	curl -L --fail -o $$@ $(2)/$$(notdir $$@)
+
+models/$(1).dllm: $(addprefix models/$(1)/,$(3)) models/$(1)/config.json models/$(1)/tokenizer.json $(CONVERTER) | build
 	target/release/detra convert models/$(1) $$@
 endef
-$(eval $(call qwen_rules,qwen3.5-2b,$(QWEN_2B_URL)))
-$(eval $(call qwen_rules,qwen3.5-0.8b,$(QWEN_08B_URL)))
+$(eval $(call qwen_rules,qwen3.5-2b,$(QWEN_2B_URL),model.safetensors))
+$(eval $(call qwen_rules,qwen3.5-0.8b,$(QWEN_08B_URL),model.safetensors))
+$(eval $(call qwen_rules,qwen3.5-4b,$(QWEN_4B_URL),model.safetensors.index.json \
+	model.safetensors-00001-of-00002.safetensors model.safetensors-00002-of-00002.safetensors))
 
 $(UCD)/UnicodeData.txt $(UCD)/PropList.txt:
 	mkdir -p $(UCD)
@@ -91,7 +104,7 @@ unicode-classes: $(UCD)/UnicodeData.txt $(UCD)/PropList.txt ## Regenerate the to
 	git diff --stat --exit-code crates/detra/src/unicode_classes.rs && echo "unicode_classes.rs: unchanged"
 
 .PHONY: models
-models: $(STORIES) $(QWEN_2B) $(QWEN_08B) ## Download all models, convert them and check all file hashes
+models: $(STORIES) $(QWEN_2B) $(QWEN_08B) $(QWEN_4B) ## Download all models, convert them and check all file hashes
 	cd models && shasum -a 256 -c SHA256SUMS
 
 .PHONY: golden
@@ -99,14 +112,17 @@ golden: models ## Regenerate the golden digests on this machine
 	target/release/detra digest golden/prompts.txt --model $(STORIES) > $(GOLDEN_STORIES)
 	target/release/detra digest golden/prompts.txt --model $(QWEN_2B) > $(GOLDEN_QWEN_2B)
 	target/release/detra digest golden/prompts.txt --model $(QWEN_08B) > $(GOLDEN_QWEN_08B)
+	target/release/detra digest golden/prompts.txt --model $(QWEN_4B) > $(GOLDEN_QWEN_4B)
 
 .PHONY: verify-native
 verify-native: models ## Native release build against the golden digests
 	$(call check,target/release/detra,$(STORIES),$(GOLDEN_STORIES),native stories15M)
 	$(call check,target/release/detra,$(QWEN_2B),$(GOLDEN_QWEN_2B),native qwen3.5-2b)
 	$(call check,target/release/detra,$(QWEN_08B),$(GOLDEN_QWEN_08B),native qwen3.5-0.8b)
+	$(call check,target/release/detra,$(QWEN_4B),$(GOLDEN_QWEN_4B),native qwen3.5-4b)
 	$(call check,DETRA_THREADS=1 target/release/detra,$(QWEN_2B),$(GOLDEN_QWEN_2B),native qwen3.5-2b single-threaded)
 	$(call check,DETRA_THREADS=1 target/release/detra,$(QWEN_08B),$(GOLDEN_QWEN_08B),native qwen3.5-0.8b single-threaded)
+	$(call check,DETRA_THREADS=1 target/release/detra,$(QWEN_4B),$(GOLDEN_QWEN_4B),native qwen3.5-4b single-threaded)
 
 .PHONY: verify-debug
 verify-debug: models ## Unoptimized build with overflow checks enabled (small model)
@@ -119,6 +135,7 @@ verify-x86_64: models ## x86-64 build run under Rosetta
 	$(call check,target/x86_64-apple-darwin/release/detra,$(STORIES),$(GOLDEN_STORIES),x86_64 stories15M)
 	$(call check,target/x86_64-apple-darwin/release/detra,$(QWEN_2B),$(GOLDEN_QWEN_2B),x86_64 qwen3.5-2b)
 	$(call check,target/x86_64-apple-darwin/release/detra,$(QWEN_08B),$(GOLDEN_QWEN_08B),x86_64 qwen3.5-0.8b)
+	$(call check,target/x86_64-apple-darwin/release/detra,$(QWEN_4B),$(GOLDEN_QWEN_4B),x86_64 qwen3.5-4b)
 
 .PHONY: verify-wasm
 verify-wasm: models ## WebAssembly (32-bit) build run under Node's WASI (small model)
@@ -143,7 +160,7 @@ verify-docker: models ## Small model on emulated big-endian s390x, 32-bit x86 an
 	$(call docker_verify,linux/amd64)
 
 .PHONY: verify-docker-qwen
-verify-docker-qwen: models ## Both Qwen3.5 models on emulated big-endian s390x Linux (needs Docker, very slow)
+verify-docker-qwen: models ## Qwen3.5-2B and Qwen3.5-0.8B on emulated big-endian s390x Linux (needs Docker, very slow)
 	mkdir -p target
 	docker run --rm --platform linux/s390x -v "$(CURDIR)":/src:ro -w /src \
 		-e CARGO_TARGET_DIR=/tmp/target $(RUST_IMAGE) sh -c \

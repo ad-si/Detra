@@ -96,7 +96,8 @@ def bench_torch(src):
     load_time = time.perf_counter() - start
 
     def ids(prompt):
-        text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+        text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
+                                       add_generation_prompt=True, enable_thinking=False)
         return tok(text, return_tensors="pt", add_special_tokens=False).input_ids
 
     new = 24

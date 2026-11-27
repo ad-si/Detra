@@ -1,4 +1,4 @@
-//! Model file format (`.dllm`, version 4). Integers are little-endian `u32`/`i32`
+//! Model file format (`.dllm`, version 5). Integers are little-endian `u32`/`i32`
 //! unless noted.
 //!
 //! ```text
@@ -6,7 +6,7 @@
 //! header (u32 each):
 //!   version, dim, hidden_dim, n_layers, vocab_size, seq_len, rms_eps_q32,
 //!   n_heads, n_kv_heads, head_dim, rotary_dim, rope_halves, qk_norm, out_gate,
-//!   lin_heads, lin_k_dim, lin_v_dim, conv_kernel,
+//!   lin_k_heads, lin_v_heads, lin_k_dim, lin_v_dim, conv_kernel,
 //!   shared_classifier, tokenizer_kind, echo_prompt, trim_prompt
 //! layer_types   u32[n_layers]            0 = attention, 1 = gated delta
 //! tok_emb       [vocab_size, dim]        Q24
@@ -14,8 +14,8 @@
 //!   norm1       [dim]                    Q24
 //!   attention:  wq [q_rows, dim], wk [kv_rows, dim], wv [kv_rows, dim],
 //!               wo [dim, n_heads * head_dim]; if qk_norm: q_norm, k_norm [head_dim]
-//!   delta:      w_qkv [2K + V, dim], w_z [V, dim], w_b, w_a [lin_heads, dim],
-//!               conv [2K + V, conv_kernel], a_exp, dt_bias [lin_heads],
+//!   delta:      w_qkv [2K + V, dim], w_z [V, dim], w_b, w_a [lin_v_heads, dim],
+//!               conv [2K + V, conv_kernel], a_exp, dt_bias [lin_v_heads],
 //!               gnorm [lin_v_dim], w_out [dim, V]
 //!   norm2       [dim]
 //!   w_gate, w_up [hidden_dim, dim], w_down [dim, hidden_dim]
@@ -36,8 +36,12 @@
 //! Packing is lossless for the values it is used for and only saves space and time:
 //! the two encodings of the same values give the same results.
 //! `q_rows = n_heads * head_dim * (1 + out_gate)`, `kv_rows = n_kv_heads * head_dim`,
-//! `K = lin_heads * lin_k_dim`, `V = lin_heads * lin_v_dim`.
+//! `K = lin_k_heads * lin_k_dim`, `V = lin_v_heads * lin_v_dim`. Value head `h` of a gated
+//! delta layer uses query and key head `h / (lin_v_heads / lin_k_heads)`.
 //! Norm weights are the effective multipliers (any `1 + w` is already applied).
+//!
+//! Version 4 files are read as well: they have no `lin_v_heads` field, which then equals
+//! `lin_k_heads`.
 //!
 //! Tokenizer kind 0 (scored merges): `u32 byte_base`, then per token `u32 rank,
 //! u32 len, bytes`. Kind 1 (byte-level BPE): per token `u32 special, u32 len, bytes`;
@@ -55,7 +59,9 @@ use crate::{err, Error, Result};
 use std::io::{Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"DLLM";
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
+/// The previous version, which is still read.
+const VERSION_4: u32 = 4;
 
 /// A matrix of Q24 values in one of the two encodings of the file format.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,7 +210,8 @@ pub struct Model {
     pub rope_halves: bool,
     pub qk_norm: bool,
     pub out_gate: bool,
-    pub lin_heads: usize,
+    pub lin_k_heads: usize,
+    pub lin_v_heads: usize,
     pub lin_k_dim: usize,
     pub lin_v_dim: usize,
     pub conv_kernel: usize,
@@ -394,11 +401,11 @@ impl Model {
     }
 
     pub fn lin_k(&self) -> usize {
-        self.lin_heads * self.lin_k_dim
+        self.lin_k_heads * self.lin_k_dim
     }
 
     pub fn lin_v(&self) -> usize {
-        self.lin_heads * self.lin_v_dim
+        self.lin_v_heads * self.lin_v_dim
     }
 
     pub fn conv_dim(&self) -> usize {
@@ -421,7 +428,8 @@ impl Model {
             ("n_kv_heads", self.n_kv_heads, 1, 1 << 10),
             ("head_dim", self.head_dim, 2, 1 << 14),
             ("rotary_dim", self.rotary_dim, 2, 1 << 14),
-            ("lin_heads", self.lin_heads, 0, 1 << 10),
+            ("lin_k_heads", self.lin_k_heads, 0, 1 << 10),
+            ("lin_v_heads", self.lin_v_heads, 0, 1 << 10),
             ("lin_k_dim", self.lin_k_dim, 0, 1 << 12),
             ("lin_v_dim", self.lin_v_dim, 0, 1 << 12),
             ("conv_kernel", self.conv_kernel, 0, 64),
@@ -433,6 +441,10 @@ impl Model {
         }
         if !self.n_heads.is_multiple_of(self.n_kv_heads) {
             return err("n_heads is not a multiple of n_kv_heads");
+        }
+        // Also rejects value heads without key heads (only 0 is a multiple of 0).
+        if !self.lin_v_heads.is_multiple_of(self.lin_k_heads) {
+            return err("lin_v_heads is not a multiple of lin_k_heads");
         }
         if !self.rotary_dim.is_multiple_of(2) || self.rotary_dim > self.head_dim {
             return err("rotary_dim must be even and at most head_dim");
@@ -461,16 +473,16 @@ impl Model {
                     check("k_norm", a.k_norm.len(), norm)?;
                 }
                 Mixer::Delta(g) => {
-                    if self.lin_heads == 0 || self.lin_k_dim == 0 || self.lin_v_dim == 0 || self.conv_kernel == 0 {
+                    if self.lin_k_heads == 0 || self.lin_v_heads == 0 || self.lin_k_dim == 0 || self.lin_v_dim == 0 || self.conv_kernel == 0 {
                         return err("gated delta layer present but its dimensions are zero");
                     }
                     check("w_qkv", g.w_qkv.len(), mul(self.conv_dim(), d)?)?;
                     check("w_z", g.w_z.len(), mul(self.lin_v(), d)?)?;
-                    check("w_b", g.w_b.len(), mul(self.lin_heads, d)?)?;
-                    check("w_a", g.w_a.len(), mul(self.lin_heads, d)?)?;
+                    check("w_b", g.w_b.len(), mul(self.lin_v_heads, d)?)?;
+                    check("w_a", g.w_a.len(), mul(self.lin_v_heads, d)?)?;
                     check("conv", g.conv.len(), mul(self.conv_dim(), self.conv_kernel)?)?;
-                    check("a_exp", g.a_exp.len(), self.lin_heads)?;
-                    check("dt_bias", g.dt_bias.len(), self.lin_heads)?;
+                    check("a_exp", g.a_exp.len(), self.lin_v_heads)?;
+                    check("dt_bias", g.dt_bias.len(), self.lin_v_heads)?;
                     check("gnorm", g.gnorm.len(), self.lin_v_dim)?;
                     check("w_out", g.w_out.len(), mul(d, self.lin_v())?)?;
                 }
@@ -545,7 +557,7 @@ impl Model {
             return err("not a DLLM model file");
         }
         let version = r.u32()?;
-        if version != VERSION {
+        if version != VERSION && version != VERSION_4 {
             return err(format!("unsupported model version {version} (expected {VERSION})"));
         }
         let mut m = Model {
@@ -561,7 +573,8 @@ impl Model {
             rope_halves: false,
             qk_norm: false,
             out_gate: false,
-            lin_heads: 0,
+            lin_k_heads: 0,
+            lin_v_heads: 0,
             lin_k_dim: 0,
             lin_v_dim: 0,
             conv_kernel: 0,
@@ -591,7 +604,8 @@ impl Model {
         m.rope_halves = r.flag("rope_halves")?;
         m.qk_norm = r.flag("qk_norm")?;
         m.out_gate = r.flag("out_gate")?;
-        m.lin_heads = r.u32()? as usize;
+        m.lin_k_heads = r.u32()? as usize;
+        m.lin_v_heads = if version == VERSION_4 { m.lin_k_heads } else { r.u32()? as usize };
         m.lin_k_dim = r.u32()? as usize;
         m.lin_v_dim = r.u32()? as usize;
         m.conv_kernel = r.u32()? as usize;
@@ -621,11 +635,11 @@ impl Model {
                 1 => Mixer::Delta(Delta {
                     w_qkv: r.tensor(mul(m.conv_dim(), d)?)?,
                     w_z: r.tensor(mul(m.lin_v(), d)?)?,
-                    w_b: r.tensor(mul(m.lin_heads, d)?)?,
-                    w_a: r.tensor(mul(m.lin_heads, d)?)?,
+                    w_b: r.tensor(mul(m.lin_v_heads, d)?)?,
+                    w_a: r.tensor(mul(m.lin_v_heads, d)?)?,
                     conv: r.i32s(mul(m.conv_dim(), m.conv_kernel)?)?,
-                    a_exp: r.i32s(m.lin_heads)?,
-                    dt_bias: r.i32s(m.lin_heads)?,
+                    a_exp: r.i32s(m.lin_v_heads)?,
+                    dt_bias: r.i32s(m.lin_v_heads)?,
                     gnorm: r.i32s(m.lin_v_dim)?,
                     w_out: r.tensor(mul(d, m.lin_v())?)?,
                 }),
@@ -750,7 +764,8 @@ impl Model {
             self.rope_halves as u32,
             self.qk_norm as u32,
             self.out_gate as u32,
-            self.lin_heads as u32,
+            self.lin_k_heads as u32,
+            self.lin_v_heads as u32,
             self.lin_k_dim as u32,
             self.lin_v_dim as u32,
             self.conv_kernel as u32,

@@ -26,9 +26,9 @@ which varies with hardware, kernels, thread count, and batching.
 
 **Disadvantages:**
 
-- **Slower:** CPU only, about 3× slower generation
-  and 65–75× slower prompt processing than MLX on a GPU (see [Performance]).
-- **Few models:** Only Qwen3.5-2B and Qwen3.5-0.8B.
+- **Slower:** CPU only, about 3–5× slower generation
+  and 65–90× slower prompt processing than MLX on a GPU (see [Performance]).
+- **Few models:** Only Qwen3.5-4B, Qwen3.5-2B, and Qwen3.5-0.8B.
 - **Limited features:** No tools, images, or thinking mode yet.
 
 [Performance]: #performance
@@ -59,9 +59,10 @@ which varies with hardware, kernels, thread count, and batching.
   Floating point is only used in `detra-convert`,
   the converter for the test model.
 
-The supported models are [Qwen3.5-2B] (the default)
-and [Qwen3.5-0.8B] (about 2.3× faster, lower quality),
-both text part only, thinking mode off.
+The supported models are [Qwen3.5-2B] (the default),
+[Qwen3.5-0.8B] (about 2.3× faster, lower quality),
+and [Qwen3.5-4B] (slower, higher quality),
+all text part only, thinking mode off.
 For testing, the 15M-parameter [stories15M] from [llama2.c] is also used:
 it is small enough to run under emulation, so it is verified on every architecture.
 It is not meant for actual use.
@@ -71,6 +72,7 @@ prompts should be in NFC to match the original Qwen tokenizer.
 
 [Qwen3.5-2B]: https://huggingface.co/Qwen/Qwen3.5-2B
 [Qwen3.5-0.8B]: https://huggingface.co/Qwen/Qwen3.5-0.8B
+[Qwen3.5-4B]: https://huggingface.co/Qwen/Qwen3.5-4B
 [stories15M]: https://huggingface.co/karpathy/tinyllamas
 [llama2.c]: https://github.com/karpathy/llama2.c
 
@@ -127,7 +129,7 @@ Checkpoint files that are already in a local Hugging Face cache
 as used by `transformers`, `mlx-lm`, vLLM and others)
 are used from there if their SHA-256 matches.
 It needs disk space for the checkpoint and the converted model
-(8.3 GB for `qwen3.5-2b`, 3.3 GB for `qwen3.5-0.8b`),
+(8.3 GB for `qwen3.5-2b`, 3.3 GB for `qwen3.5-0.8b`, 17.8 GB for `qwen3.5-4b`),
 and an interrupted download is resumed when the command runs again.
 Downloads are kept in `$XDG_CACHE_HOME/detra` (default `~/.cache/detra`)
 until the model is installed.
@@ -146,7 +148,7 @@ detra serve [--port N] [--host H] [--allow-origin URL] [--model M]
 detra convert <checkpoint-dir> <out.dllm>
 ```
 
-A model `M` is a name (`qwen3.5-2b` or `qwen3.5-0.8b`)
+A model `M` is a name (`qwen3.5-2b`, `qwen3.5-0.8b`, or `qwen3.5-4b`)
 or the path of a `.dllm` file.
 Without `--model`, `$DETRA_MODEL` is used, or else `qwen3.5-2b`.
 Models are installed in `$XDG_DATA_HOME/detra`
@@ -157,7 +159,8 @@ The prompt is used byte for byte; `--prompt-file` reads it from a file
 (every byte counts, including a final newline).
 Put `--` before a prompt that starts with dashes.
 `detra convert` converts a Hugging Face Qwen3.5 checkpoint directory
-(`config.json`, `tokenizer.json`, `model.safetensors`) to a `.dllm` file
+(`config.json`, `tokenizer.json`, and `model.safetensors`
+or the shards listed in `model.safetensors.index.json`) to a `.dllm` file
 and prints its SHA-256; `detra pull` does this for the supported models.
 
 
@@ -224,7 +227,7 @@ The `verify` targets compare that output with the files in `golden/`:
 | `make verify-wasm`        | WebAssembly (32-bit) build run under Node's WASI (stories15M)        |
 | `make verify-miri`        | Synthetic models on big-endian 64-bit and 32-bit targets             |
 | `make verify-docker`      | Emulated big-endian s390x, 32-bit x86, and x86-64 Linux (stories15M) |
-| `make verify-docker-qwen` | Both Qwen3.5 models on emulated big-endian s390x Linux               |
+| `make verify-docker-qwen` | Qwen3.5-2B and 0.8B on emulated big-endian s390x Linux               |
 
 `make verify` runs the tests, the linter, and the first four.
 `make test` runs the test-suite natively in debug and release builds;
@@ -233,7 +236,7 @@ the x86-64, WASM, Miri, and `verify-docker` targets also run it on their archite
 from the Unicode Character Database (version pinned in the Makefile).
 `make check-qwen` (which needs [uv] for Python and PyTorch) compares the integer engine
 with the Hugging Face float implementation of Qwen3.5-2B
-(`QWEN_MODEL=qwen3.5-0.8b` for the smaller model),
+(`QWEN_MODEL=qwen3.5-0.8b` or `QWEN_MODEL=qwen3.5-4b` for the others),
 including the chat template for multi-turn conversations.
 `make setup` installs the required Rust targets and components.
 Run `make help` for all targets.
@@ -246,6 +249,9 @@ Apple M4 Max (10 performance cores), greedy decoding,
 
 | Model        | Runtime                        | Prompt      | Generation | Peak memory |
 | ------------ | ------------------------------ | ----------- | ---------- | ----------- |
+| Qwen3.5-4B   | Detra (integer, CPU)           | ~15 tok/s   | ~9 tok/s   | 8.1 GiB     |
+| Qwen3.5-4B   | Detra (integer, CPU, 1 thread) | ~3 tok/s    | ~2 tok/s   | 8.1 GiB     |
+| Qwen3.5-4B   | MLX (bfloat16, GPU)            | ~1350 tok/s | ~41 tok/s  | 8.0 GiB     |
 | Qwen3.5-2B   | Detra (integer, CPU)           | ~45 tok/s   | ~29 tok/s  | 3.6 GiB     |
 | Qwen3.5-2B   | Detra (integer, CPU, 1 thread) | ~7 tok/s    | ~5 tok/s   | 3.6 GiB     |
 | Qwen3.5-2B   | MLX (bfloat16, GPU)            | ~2900 tok/s | ~85 tok/s  | 3.6 GiB     |

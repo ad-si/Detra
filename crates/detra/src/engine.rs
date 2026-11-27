@@ -4,7 +4,8 @@
 //! SiLU-gated MLP to the residual stream. The mixer is either causal attention
 //! (optional per-head query/key RMSNorm, RoPE on the first `rotary_dim` dimensions of
 //! each head, grouped keys/values, optional sigmoid output gate) or a gated delta
-//! layer (causal depthwise convolution, then a per-head recurrent associative memory).
+//! layer (causal depthwise convolution, then a per-head recurrent associative memory,
+//! where groups of value heads may share one query and key head).
 //!
 //! Number formats: the residual stream is `i64` Q32, every other activation `i32` Q20,
 //! weights Q24, unit vectors / gates / probabilities Q30, recurrent state `i64` Q32.
@@ -108,11 +109,11 @@ enum LayerState {
     /// Rotated keys and values of every past position, `kv_rows` each.
     Attention { keys: Arc<Vec<i32>>, vals: Arc<Vec<i32>> },
     /// `conv`: the last `conv_kernel - 1` inputs of the convolution, oldest first.
-    /// `memory`: per head a `[lin_k_dim, lin_v_dim]` matrix in Q32.
+    /// `memory`: per value head a `[lin_k_dim, lin_v_dim]` matrix in Q32.
     Delta { conv: Vec<i32>, memory: Vec<Arc<Vec<i64>>> },
 }
 
-/// One head of a gated delta layer over `count` consecutive positions.
+/// One value head of a gated delta layer over `count` consecutive positions.
 ///
 /// `qkv` holds, per position, the convolved queries, keys and values of all heads;
 /// `z`, `a` and `b` the gate projections. `mem` is the head's memory, updated in place.
@@ -130,8 +131,10 @@ fn delta_head(
     mem: &mut [i64],
     out: &mut Vec<i64>,
 ) {
-    let (heads, kd, vd) = (m.lin_heads, m.lin_k_dim, m.lin_v_dim);
+    let (heads, kd, vd) = (m.lin_v_heads, m.lin_k_dim, m.lin_v_dim);
     let (key_dim, conv_dim, value_dim) = (m.lin_k(), m.conv_dim(), m.lin_v());
+    // The query and key head this value head shares with the others of its group.
+    let kh = h / (m.lin_v_heads / m.lin_k_heads);
     let mut key = vec![0i64; kd];
     let mut query = vec![0i64; kd];
     let mut kv_mem = vec![0i128; vd];
@@ -139,8 +142,8 @@ fn delta_head(
     let mut read = vec![0i128; vd];
     for t in 0..count {
         let at = &qkv[t * conv_dim..(t + 1) * conv_dim];
-        let q_raw = &at[h * kd..(h + 1) * kd];
-        let k_raw = &at[key_dim + h * kd..key_dim + (h + 1) * kd];
+        let q_raw = &at[kh * kd..(kh + 1) * kd];
+        let k_raw = &at[key_dim + kh * kd..key_dim + (kh + 1) * kd];
         let value = &at[2 * key_dim + h * vd..2 * key_dim + (h + 1) * vd];
         let z = &z[t * value_dim + h * vd..t * value_dim + (h + 1) * vd];
 
@@ -263,7 +266,7 @@ impl Session {
                 }
                 Mixer::Delta(_) => LayerState::Delta {
                     conv: vec![0; (model.conv_kernel - 1) * model.conv_dim()],
-                    memory: (0..model.lin_heads)
+                    memory: (0..model.lin_v_heads)
                         .map(|_| Arc::new(vec![0; model.lin_k_dim * model.lin_v_dim]))
                         .collect(),
                 },
@@ -449,7 +452,7 @@ impl Session {
     /// Gated delta layer for `count` new positions. Returns the update of the residual.
     fn delta(&mut self, l: usize, xn: &Arc<Vec<i32>>, count: usize) -> Vec<i64> {
         let m = Arc::clone(&self.model);
-        let (heads, vd) = (m.lin_heads, m.lin_v_dim);
+        let (heads, vd) = (m.lin_v_heads, m.lin_v_dim);
         let (conv_dim, kernel, value_dim) = (m.conv_dim(), m.conv_kernel, m.lin_v());
 
         let mixed = activations(self.pool().matmul(&m, Weight::Qkv(l), xn, count, TO_ACT));

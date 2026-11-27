@@ -4,6 +4,8 @@ description = "Offline converter from llama2.c float checkpoints to the integer-
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
 
 [dependencies]
-detra = { path = "../detra" }
+detra = { path = "../detra", version = "0.1.0" }

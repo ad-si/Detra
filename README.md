@@ -29,8 +29,7 @@ Disadvantages:
 
 - **Slower:** CPU only, about 3× slower generation
   and 65–75× slower prompt processing than MLX on a GPU (see [Performance]).
-- **Few models:** Only Qwen3.5-2B and Qwen3.5-0.8B,
-  which need an offline conversion.
+- **Few models:** Only Qwen3.5-2B and Qwen3.5-0.8B.
 - **Limited features:** No tools, images, or thinking mode,
   and the server runs one generation at a time.
 
@@ -53,13 +52,18 @@ Disadvantages:
   so neither their number nor their scheduling can affect a result.
 - Sampling (temperature, top-k, top-p) is seeded and also integer-only.
 - The identity of a model is the SHA-256 of its converted `.dllm` file.
-  Floating point is only used in the offline converters
-  (`detra-convert` and `tools/convert_qwen35.py`).
+- Converting a Qwen3.5 checkpoint is integer-only too, so it gives
+  the same file on every machine: weights are scaled exactly,
+  and the few transcendental values (`exp`, and `cos`/`sin` for RoPE)
+  are computed in 96-bit fixed point and correctly rounded.
+  `detra pull` therefore converts on the user's machine
+  and checks the result against the published hash.
+  Floating point is only used in `detra-convert`,
+  the converter for the test model.
 
 The supported models are [Qwen3.5-2B] (the default)
 and [Qwen3.5-0.8B] (about 2.3× faster, lower quality),
 both text part only, thinking mode off.
-`make install QWEN_MODEL=qwen3.5-0.8b` installs the smaller one instead.
 For testing, the 15M-parameter [stories15M] from [llama2.c] is also used:
 it is small enough to run under emulation, so it is verified on every architecture.
 It is not meant for actual use.
@@ -103,8 +107,8 @@ How this is ensured:
 This rests on a manual audit of the arithmetic plus the tests above,
 not on a machine-checked proof.
 
-Not covered: the offline converters (a model is identified by the hash
-of the converted file, not by how it was produced),
+Not covered: model conversion (a model is identified by the hash
+of the converted file, and `detra pull` rejects a conversion with any other hash),
 and prompt bytes as passed by the shell on platforms
 where arguments are not raw bytes (use `--prompt-file` there).
 
@@ -112,23 +116,37 @@ where arguments are not raw bytes (use `--prompt-file` there).
 ## Usage
 
 ```sh
-make install
+cargo install detra
+detra pull
 detra generate "Why is the sky blue?" --max-tokens 100
 ```
 
+`detra pull [model]` downloads a model's checkpoint from Hugging Face
+at a pinned revision (with `curl`), checks its SHA-256,
+converts it, and checks that the result is bit-identical to the published model.
+It needs disk space for the checkpoint and the converted model
+(8.3 GB for `qwen3.5-2b`, 3.3 GB for `qwen3.5-0.8b`),
+and an interrupted download is resumed when the command runs again.
+From a clone of this repository, `make install` builds and installs
+the CLI and the default model instead.
+
 ```txt
+detra pull [model]
 detra generate <prompt> [--max-tokens N] [--temperature T] [--top-k K]
-                [--top-p P] [--seed S] [--model model.dllm]
+                [--top-p P] [--seed S] [--model M]
 detra generate --prompt-file <path> [...]
-detra info [--model model.dllm]
-detra digest <prompts.txt> [--max-tokens N] [--model model.dllm]
+detra info [--model M]
+detra digest <prompts.txt> [--max-tokens N] [--model M]
 detra trace <prompt> | --messages <chat.json> [--max-tokens N] [--logits out.bin]
-detra serve [--port N] [--host H] [--allow-origin URL] [--model model.dllm]
+detra serve [--port N] [--host H] [--allow-origin URL] [--model M]
+detra convert <checkpoint-dir> <out.dllm>
 ```
 
-Without `--model`, `$DETRA_MODEL` is used,
-or else `$XDG_DATA_HOME/detra/model.dllm`
-(default `~/.local/share/detra/model.dllm`).
+A model `M` is a name (`qwen3.5-2b` or `qwen3.5-0.8b`)
+or the path of a `.dllm` file.
+Without `--model`, `$DETRA_MODEL` is used, or else `qwen3.5-2b`.
+Models are installed in `$XDG_DATA_HOME/detra`
+(default `~/.local/share/detra`).
 Temperature 0 (the default) is greedy decoding.
 The text is printed as it is generated.
 The prompt is used byte for byte; `--prompt-file` reads it from a file
@@ -142,7 +160,7 @@ Put `--` before a prompt that starts with dashes.
 detra serve                # http://127.0.0.1:8080/v1
 ```
 
-`detra serve [--port N] [--host H] [--allow-origin URL] [--record log.jsonl] [--model model.dllm]`
+`detra serve [--port N] [--host H] [--allow-origin URL] [--record log.jsonl] [--model M]`
 serves an OpenAI-compatible API, so any chat front end
 that talks to OpenAI-compatible servers can use it
 (e.g. Open WebUI, LibreChat, Chatbox, Jan, or the `openai` client libraries).

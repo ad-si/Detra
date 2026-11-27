@@ -52,7 +52,7 @@
 //! trimmed in the same way. The identity of a model is the SHA-256 of its file.
 
 use crate::{err, Error, Result};
-use std::io::Read;
+use std::io::{Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"DLLM";
 pub const VERSION: u32 = 4;
@@ -73,7 +73,7 @@ impl Tensor {
 
     /// The packed form of `v`, if it has one: an 11-bit signed mantissa times a power
     /// of two.
-    fn pack_value(v: i32) -> Option<i16> {
+    pub(crate) fn pack_value(v: i32) -> Option<i16> {
         if v == 0 {
             return Some(0);
         }
@@ -303,35 +303,68 @@ impl<R: Read> Reader<R> {
     }
 }
 
-fn put_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_le_bytes());
+/// Buffered little-endian output for [`Model::write`].
+struct Writer<'w, W: Write> {
+    inner: &'w mut W,
+    buf: Vec<u8>,
 }
 
-fn put_i32s(out: &mut Vec<u8>, values: &[i32]) {
-    for v in values {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-}
+impl<W: Write> Writer<'_, W> {
+    const CAPACITY: usize = 1 << 20;
 
-fn put_tensor(out: &mut Vec<u8>, tensor: &Tensor) {
-    match tensor {
-        Tensor::Wide(values) => {
-            put_u32(out, 0);
-            put_i32s(out, values);
+    fn flush_if_full(&mut self) -> Result<()> {
+        if self.buf.len() >= Self::CAPACITY {
+            self.flush()?;
         }
-        Tensor::Packed(values) => {
-            put_u32(out, 1);
-            for v in values {
-                out.extend_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.inner.write_all(&self.buf).map_err(|e| Error(format!("cannot write model: {e}")))?;
+        self.buf.clear();
+        Ok(())
+    }
+
+    fn bytes(&mut self, data: &[u8]) -> Result<()> {
+        self.buf.extend_from_slice(data);
+        self.flush_if_full()
+    }
+
+    fn u32(&mut self, v: u32) -> Result<()> {
+        self.bytes(&v.to_le_bytes())
+    }
+
+    fn i32s(&mut self, values: &[i32]) -> Result<()> {
+        for chunk in values.chunks(Self::CAPACITY / 4) {
+            self.buf.extend(chunk.iter().flat_map(|v| v.to_le_bytes()));
+            self.flush_if_full()?;
+        }
+        Ok(())
+    }
+
+    fn tensor(&mut self, tensor: &Tensor) -> Result<()> {
+        match tensor {
+            Tensor::Wide(values) => {
+                self.u32(0)?;
+                self.i32s(values)
+            }
+            Tensor::Packed(values) => {
+                self.u32(1)?;
+                for chunk in values.chunks(Self::CAPACITY / 2) {
+                    self.buf.extend(chunk.iter().flat_map(|v| v.to_le_bytes()));
+                    self.flush_if_full()?;
+                }
+                Ok(())
             }
         }
     }
-}
 
-fn put_ids(out: &mut Vec<u8>, ids: &[u32]) {
-    put_u32(out, ids.len() as u32);
-    for &id in ids {
-        put_u32(out, id);
+    fn ids(&mut self, ids: &[u32]) -> Result<()> {
+        self.u32(ids.len() as u32)?;
+        for &id in ids {
+            self.u32(id)?;
+        }
+        Ok(())
     }
 }
 
@@ -688,9 +721,16 @@ impl Model {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        self.validate()?;
         let mut out = Vec::new();
-        out.extend_from_slice(&MAGIC);
+        self.write(&mut out)?;
+        Ok(out)
+    }
+
+    /// Write the model in the file format to `inner`.
+    pub fn write(&self, inner: &mut impl Write) -> Result<()> {
+        self.validate()?;
+        let out = &mut Writer { inner, buf: Vec::with_capacity(Writer::<Vec<u8>>::CAPACITY * 2) };
+        out.bytes(&MAGIC)?;
         let tokenizer_kind = match self.vocab {
             Vocab::Scored { .. } => 0,
             Vocab::Bpe { .. } => 1,
@@ -719,78 +759,78 @@ impl Model {
             self.echo_prompt as u32,
             self.trim_prompt as u32,
         ] {
-            put_u32(&mut out, v);
+            out.u32(v)?;
         }
         for l in &self.layers {
-            put_u32(&mut out, matches!(l.mixer, Mixer::Delta(_)) as u32);
+            out.u32(matches!(l.mixer, Mixer::Delta(_)) as u32)?;
         }
-        put_tensor(&mut out, &self.tok_emb);
+        out.tensor(&self.tok_emb)?;
         for l in &self.layers {
-            put_i32s(&mut out, &l.norm1);
+            out.i32s(&l.norm1)?;
             match &l.mixer {
                 Mixer::Attention(a) => {
                     for t in [&a.wq, &a.wk, &a.wv, &a.wo] {
-                        put_tensor(&mut out, t);
+                        out.tensor(t)?;
                     }
-                    put_i32s(&mut out, &a.q_norm);
-                    put_i32s(&mut out, &a.k_norm);
+                    out.i32s(&a.q_norm)?;
+                    out.i32s(&a.k_norm)?;
                 }
                 Mixer::Delta(g) => {
                     for t in [&g.w_qkv, &g.w_z, &g.w_b, &g.w_a] {
-                        put_tensor(&mut out, t);
+                        out.tensor(t)?;
                     }
                     for t in [&g.conv, &g.a_exp, &g.dt_bias, &g.gnorm] {
-                        put_i32s(&mut out, t);
+                        out.i32s(t)?;
                     }
-                    put_tensor(&mut out, &g.w_out);
+                    out.tensor(&g.w_out)?;
                 }
             }
-            put_i32s(&mut out, &l.norm2);
+            out.i32s(&l.norm2)?;
             for t in [&l.w_gate, &l.w_up, &l.w_down] {
-                put_tensor(&mut out, t);
+                out.tensor(t)?;
             }
         }
-        put_i32s(&mut out, &self.final_norm);
-        put_i32s(&mut out, &self.rope_cos);
-        put_i32s(&mut out, &self.rope_sin);
+        out.i32s(&self.final_norm)?;
+        out.i32s(&self.rope_cos)?;
+        out.i32s(&self.rope_sin)?;
         if let Some(w) = &self.wcls {
-            put_tensor(&mut out, w);
+            out.tensor(w)?;
         }
         match &self.vocab {
             Vocab::Scored { byte_base, ranks } => {
-                put_u32(&mut out, *byte_base);
+                out.u32(*byte_base)?;
                 for (token, rank) in self.tokens.iter().zip(ranks) {
-                    put_u32(&mut out, *rank);
-                    put_u32(&mut out, token.len() as u32);
-                    out.extend_from_slice(token);
+                    out.u32(*rank)?;
+                    out.u32(token.len() as u32)?;
+                    out.bytes(token)?;
                 }
             }
             Vocab::Bpe { special, merges, byte_tokens, classes } => {
                 for (token, flag) in self.tokens.iter().zip(special) {
-                    put_u32(&mut out, *flag as u32);
-                    put_u32(&mut out, token.len() as u32);
-                    out.extend_from_slice(token);
+                    out.u32(*flag as u32)?;
+                    out.u32(token.len() as u32)?;
+                    out.bytes(token)?;
                 }
-                put_u32(&mut out, merges.len() as u32);
+                out.u32(merges.len() as u32)?;
                 for v in merges.iter().flatten() {
-                    put_u32(&mut out, *v);
+                    out.u32(*v)?;
                 }
                 for v in byte_tokens {
-                    put_u32(&mut out, *v);
+                    out.u32(*v)?;
                 }
-                put_u32(&mut out, classes.len() as u32);
+                out.u32(classes.len() as u32)?;
                 for v in classes.iter().flatten() {
-                    put_u32(&mut out, *v);
+                    out.u32(*v)?;
                 }
             }
         }
-        put_ids(&mut out, &self.prefix);
-        put_ids(&mut out, &self.suffix);
-        put_ids(&mut out, &self.stop);
-        put_u32(&mut out, self.chat.is_some() as u32);
+        out.ids(&self.prefix)?;
+        out.ids(&self.suffix)?;
+        out.ids(&self.stop)?;
+        out.u32(self.chat.is_some() as u32)?;
         for list in self.chat.iter().flat_map(Chat::lists) {
-            put_ids(&mut out, list);
+            out.ids(list)?;
         }
-        Ok(out)
+        out.flush()
     }
 }

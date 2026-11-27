@@ -1,6 +1,7 @@
 # Models:
 #   qwen3.5-2b    Qwen3.5-2B (text part). The default model, installed by `make install`.
 #   qwen3.5-0.8b  Qwen3.5-0.8B (text part). About 2.3x faster, lower quality.
+#   Both are converted by `detra convert`, the same integer-only converter `detra pull` uses.
 #   stories15M    15M-parameter Llama-style test model. Small enough to run under emulation,
 #                 so it is the one verified on every architecture. Not meant for actual use.
 # `install`, `serve` and `check-qwen` use $(QWEN_MODEL), e.g. `make install QWEN_MODEL=qwen3.5-0.8b`.
@@ -60,6 +61,8 @@ $(STORIES): models/stories15M.bin models/tokenizer.bin | build
 UNICODE_VERSION := 16.0.0
 UCD_URL := https://www.unicode.org/Public/$(UNICODE_VERSION)/ucd
 UCD := target/ucd-$(UNICODE_VERSION)
+CONVERTER := $(addprefix crates/detra/src/,qwen35.rs exact.rs unicode_classes.rs model.rs tokenizer.rs)
+
 # Download and conversion rules for one Qwen3.5 checkpoint.
 # $(1) = model name (directory under models/), $(2) = Hugging Face URL at a pinned revision
 define qwen_rules
@@ -71,8 +74,8 @@ models/$(1)/config.json models/$(1)/tokenizer.json models/$(1)/tokenizer_config.
 	mkdir -p models/$(1)
 	curl -L --fail -o $$@ $(2)/$$(notdir $$@)
 
-models/$(1).dllm: models/$(1)/model.safetensors models/$(1)/config.json models/$(1)/tokenizer.json tools/convert_qwen35.py
-	uv run tools/convert_qwen35.py models/$(1) $$@
+models/$(1).dllm: models/$(1)/model.safetensors models/$(1)/config.json models/$(1)/tokenizer.json $(CONVERTER) | build
+	target/release/detra convert models/$(1) $$@
 endef
 $(eval $(call qwen_rules,qwen3.5-2b,$(QWEN_2B_URL)))
 $(eval $(call qwen_rules,qwen3.5-0.8b,$(QWEN_08B_URL)))
@@ -163,14 +166,14 @@ serve: build $(QWEN) ## Serve QWEN_MODEL (default qwen3.5-2b) as an OpenAI-compa
 install: build $(QWEN) ## Install the `detra` CLI (cargo bin dir) and QWEN_MODEL (default qwen3.5-2b, to $XDG_DATA_HOME/detra)
 	cargo install --locked --path crates/detra
 	mkdir -p "$(DATA_DIR)"
-	cp $(QWEN) "$(DATA_DIR)/model.dllm"
-	@echo 'Installed. Try: detra generate "Why is the sky blue?" --max-tokens 100'
-	@echo 'or point a chat front end at `detra serve` (http://127.0.0.1:8080/v1).'
+	cp $(QWEN) "$(DATA_DIR)/$(QWEN_MODEL).dllm"
+	@echo 'Installed. Try: detra generate "Why is the sky blue?" --max-tokens 100 --model $(QWEN_MODEL)'
+	@echo 'or point a chat front end at `detra serve --model $(QWEN_MODEL)` (http://127.0.0.1:8080/v1).'
 
 .PHONY: uninstall
-uninstall: ## Remove the installed CLI and model
+uninstall: ## Remove the installed CLI and models
 	cargo uninstall detra
-	rm -f "$(DATA_DIR)/model.dllm"
+	rm -f "$(DATA_DIR)"/qwen3.5-*.dllm "$(DATA_DIR)/model.dllm"
 	-rmdir "$(DATA_DIR)"
 
 .PHONY: setup

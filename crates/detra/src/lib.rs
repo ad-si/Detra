@@ -13,15 +13,18 @@
 
 pub mod chat;
 pub mod engine;
+pub mod exact;
 pub mod fixed;
 pub mod generate;
 pub mod json;
 pub mod model;
 pub mod pool;
+pub mod qwen35;
 pub mod sample;
 pub mod server;
 pub mod sha256;
 pub mod tokenizer;
+pub mod unicode_classes;
 
 /// Error type for everything in this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]

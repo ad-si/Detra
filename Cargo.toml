@@ -6,7 +6,7 @@ members = ["crates/detra", "crates/detra-convert"]
 version = "0.1.0"
 edition = "2021"
 license = "ISC"
-repository = "https://github.com/ad-si/deterministic-llm"
+repository = "https://github.com/ad-si/Detra"
 
 [profile.release]
 opt-level = 3

@@ -97,7 +97,9 @@ verify-wasm: models ## WebAssembly (32-bit) build run under Node's WASI (small m
 .PHONY: verify-miri
 verify-miri: ## Synthetic models interpreted for big-endian 64-bit and for 32-bit targets (slow)
 	$(MIRI_TEST) --target s390x-unknown-linux-gnu
-	$(MIRI_TEST) --target i686-unknown-linux-gnu
+	# Miri hands out fresh addresses for half of all allocations by default, which
+	# exhausts a 32-bit address space before the tests finish.
+	MIRIFLAGS="-Zmiri-address-reuse-rate=1.0" $(MIRI_TEST) --target i686-unknown-linux-gnu
 
 .PHONY: verify
 verify: test lint verify-native verify-debug verify-x86_64 verify-wasm ## Fast checks: native, debug, x86-64, wasm32

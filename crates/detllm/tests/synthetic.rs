@@ -393,7 +393,9 @@ fn packed_and_unpacked_models_agree() {
         assert_ne!(twin.to_bytes().unwrap(), model.to_bytes().unwrap());
         assert_eq!(Model::from_bytes(&twin.to_bytes().unwrap()).unwrap(), twin);
         assert_eq!(digests(twin.clone(), b"the and 12 then the", 1), digests(model.clone(), b"the and 12 then the", 1));
-        assert_eq!(fuzz_digest(twin, 21, 40), fuzz_digest(model, 21, 40));
+        // Miri never reuses stack addresses, so a long run exhausts a 32-bit address space.
+        let cases = if cfg!(miri) { 4 } else { 40 };
+        assert_eq!(fuzz_digest(twin, 21, cases), fuzz_digest(model, 21, cases));
     }
     // Values that cannot be packed stay as they are, and every packed value decodes.
     assert_eq!(Tensor::pack(vec![1025]), Tensor::Wide(vec![1025]));

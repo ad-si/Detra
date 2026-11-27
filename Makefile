@@ -1,7 +1,7 @@
-# Two models are supported:
-#   stories15M    15M-parameter Llama-style model. Small enough to run under emulation, so
-#                 it is the one verified on every architecture.
-#   qwen3.5-0.8b  Qwen3.5-0.8B (text part). The model that `make install` installs.
+# Models:
+#   qwen3.5-0.8b  Qwen3.5-0.8B (text part). The supported model, installed by `make install`.
+#   stories15M    15M-parameter Llama-style test model. Small enough to run under emulation,
+#                 so it is the one verified on every architecture. Not meant for actual use.
 STORIES_URL := https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
 STORIES_TOK_URL := https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin
 QWEN_URL := https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/2fc06364715b967f1860aea9cf38778875588b17

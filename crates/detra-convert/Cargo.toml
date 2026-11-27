@@ -1,6 +1,6 @@
 [package]
 name = "detra-convert"
-description = "Offline converter from llama2.c float checkpoints to the integer-only DLLM format"
+description = "Offline converter from llama2.c float checkpoints to the integer-only DLLM format (used for Detra's test model)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

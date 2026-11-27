@@ -29,8 +29,7 @@ Disadvantages:
 
 - **Slower:** CPU only, about 3× slower generation
   and 75× slower prompt processing than MLX on a GPU (see [Performance]).
-- **Few models:** Only Qwen3.5-0.8B and stories15M,
-  each needing an offline conversion.
+- **One model:** Only Qwen3.5-0.8B, which needs an offline conversion.
 - **Limited features:** No tools, images, or thinking mode,
   and the server runs one generation at a time.
 
@@ -55,12 +54,10 @@ Disadvantages:
   Floating point is only used in the offline converters
   (`detra-convert` and `tools/convert_qwen35.py`).
 
-Two models are supported:
-
-- [Qwen3.5-0.8B] (text part only, thinking mode off).
-  This is the model `make install` installs.
-- [stories15M] from [llama2.c].
-  Small enough to run under emulation, so it is verified on every architecture.
+The supported model is [Qwen3.5-0.8B] (text part only, thinking mode off).
+For testing, the 15M-parameter [stories15M] from [llama2.c] is also used:
+it is small enough to run under emulation, so it is verified on every architecture.
+It is not meant for actual use.
 
 The engine does not apply Unicode normalization:
 prompts should be in NFC to match the original Qwen tokenizer.
